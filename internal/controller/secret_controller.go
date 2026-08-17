@@ -31,10 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
@@ -408,8 +410,10 @@ func generateAlphanumeric(length int) (string, error) {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SecretController) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Rotation arrives through the Secret watch below.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findInstancesForSecret),

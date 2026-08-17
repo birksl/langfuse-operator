@@ -28,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 	"github.com/PalenaAI/langfuse-operator/internal/langfuse"
@@ -240,8 +242,10 @@ func (r *MigrationController) cleanupCompletedJobs(ctx context.Context, instance
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *MigrationController) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Its own RequeueAfter picks up anything it still needs to observe.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&batchv1.Job{}).
 		Named("migration").
 		Complete(r)

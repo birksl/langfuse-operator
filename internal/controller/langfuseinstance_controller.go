@@ -34,9 +34,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 	"github.com/PalenaAI/langfuse-operator/internal/langfuse"
@@ -721,16 +723,21 @@ func (r *LangfuseInstanceReconciler) reconcilePDB(ctx context.Context, instance 
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LangfuseInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	builder := ctrl.NewControllerManagedBy(mgr).
+	// driftOnly suppresses status-only events from children the operator writes
+	// but never reads. Deployment is deliberately absent: derivePhase needs its
+	// status.readyReplicas.
+	driftOnly := builder.WithPredicates(predicate.GenerationChangedPredicate{})
+
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.LangfuseInstance{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&appsv1.StatefulSet{}).
-		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{}).
-		Owns(&networkingv1.NetworkPolicy{}).
-		Owns(&networkingv1.Ingress{}).
-		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
-		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&appsv1.StatefulSet{}, driftOnly).
+		Owns(&corev1.Service{}, driftOnly).
+		Owns(&corev1.ConfigMap{}, driftOnly).
+		Owns(&networkingv1.NetworkPolicy{}, driftOnly).
+		Owns(&networkingv1.Ingress{}, driftOnly).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}, driftOnly).
+		Owns(&policyv1.PodDisruptionBudget{}, driftOnly).
 		Named("langfuseinstance")
 
 	// Watch OpenShift Routes if the API is available
@@ -738,7 +745,7 @@ func (r *LangfuseInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if _, err := mgr.GetRESTMapper().RESTMapping(routeGVK.GroupKind(), routeGVK.Version); err == nil {
 		route := &unstructured.Unstructured{}
 		route.SetGroupVersionKind(routeGVK)
-		builder = builder.Owns(route)
+		b = b.Owns(route, driftOnly)
 	}
 
 	// Watch Gateway API HTTPRoutes if the API is available
@@ -746,8 +753,8 @@ func (r *LangfuseInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if _, err := mgr.GetRESTMapper().RESTMapping(httpRouteGVK.GroupKind(), httpRouteGVK.Version); err == nil {
 		httpRoute := &unstructured.Unstructured{}
 		httpRoute.SetGroupVersionKind(httpRouteGVK)
-		builder = builder.Owns(httpRoute)
+		b = b.Owns(httpRoute, driftOnly)
 	}
 
-	return builder.Complete(r)
+	return b.Complete(r)
 }

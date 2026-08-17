@@ -29,8 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 	"github.com/PalenaAI/langfuse-operator/internal/resources"
@@ -330,8 +332,10 @@ func circuitBreakerMessage(instance *v1alpha1.LangfuseInstance) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CircuitBreakerController) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Its own RequeueAfter picks up anything it still needs to observe.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("circuitbreaker").
 		Complete(r)
 }
