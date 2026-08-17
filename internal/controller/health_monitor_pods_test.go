@@ -143,38 +143,86 @@ func TestCheckWebAndWorker_PopulateStatusIssues(t *testing.T) {
 	}
 }
 
-func TestDetermineOverallHealth_Phases(t *testing.T) {
-	allTrue := []metav1.Condition{{Status: metav1.ConditionTrue}, {Status: metav1.ConditionTrue}}
-	someFalse := []metav1.Condition{{Status: metav1.ConditionTrue}, {Status: metav1.ConditionFalse}}
+// dependencyStatuses builds the four datastore probe conditions, all with the
+// given status.
+func dependencyStatuses(status metav1.ConditionStatus) []metav1.Condition {
+	conditions := make([]metav1.Condition, 0, len(dependencyConditions))
+	for _, conditionType := range dependencyConditions {
+		conditions = append(conditions, metav1.Condition{
+			Type: conditionType, Status: status, Reason: "Test",
+			LastTransitionTime: metav1.Now(),
+		})
+	}
+	return conditions
+}
+
+// withMigration returns base plus a MigrationsComplete condition, without
+// aliasing base.
+func withMigration(base []metav1.Condition, status metav1.ConditionStatus, reason string) []metav1.Condition {
+	out := make([]metav1.Condition, 0, len(base)+1)
+	out = append(out, base...)
+	return append(out, metav1.Condition{
+		Type: conditionMigrationsComplete, Status: status, Reason: reason,
+		LastTransitionTime: metav1.Now(),
+	})
+}
+
+func TestDerivePhase(t *testing.T) {
+	allTrue := dependencyStatuses(metav1.ConditionTrue)
+	allFalse := dependencyStatuses(metav1.ConditionFalse)
 
 	cases := []struct {
 		name       string
 		conditions []metav1.Condition
+		ready      bool // deployments have ready replicas
 		issues     []v1alpha1.PodIssue
 		wantPhase  string
 		wantReady  bool
 	}{
-		{"all healthy", allTrue, nil, phaseRunning, true},
-		{"recoverable failure is Degraded", someFalse,
+		{"all healthy", allTrue, true, nil, phaseRunning, true},
+		{"recoverable failure is Degraded", allFalse, true,
 			[]v1alpha1.PodIssue{{Reason: "CrashLoopBackOff"}}, phaseDegraded, false},
-		{"no pod detail is Degraded", someFalse, nil, phaseDegraded, false},
-		{"fatal misconfiguration is Error", someFalse,
+		{"no pod detail is Degraded", allFalse, true, nil, phaseDegraded, false},
+		{"fatal misconfiguration is Error", allFalse, true,
 			[]v1alpha1.PodIssue{{Reason: "ImagePullBackOff", Fatal: true}}, phaseError, false},
+
+		// Deployment readiness is checked before the probes, so a rollout that
+		// has not come up yet is Pending — never Degraded. Two controllers
+		// disagreeing on exactly this pair is what produced the write loop.
+		{"deployments not ready is Pending", allTrue, false, nil, phasePending, false},
+		{"deployments not ready with failing probes is Pending", allFalse, false, nil, phasePending, false},
+
+		// Absent probes mean "not yet reported", which must not read as unhealthy.
+		{"no probes yet is Pending", nil, true, nil, phasePending, false},
+
+		{"migration in flight is Migrating", withMigration(allTrue,
+			metav1.ConditionFalse, reasonMigrationStarted), false, nil, phaseMigrating, false},
+		{"failed migration is Error", withMigration(allTrue,
+			metav1.ConditionFalse, reasonMigrationFailed), false, nil, phaseError, false},
+		{"completed migration does not block Running", withMigration(allTrue,
+			metav1.ConditionTrue, reasonMigrationSucceeded), true, nil, phaseRunning, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			instance := podTestInstance()
-			instance.Status.Web = &v1alpha1.ComponentStatus{Issues: tc.issues}
+			instance.Status.Conditions = tc.conditions
 
-			r := &HealthMonitorReconciler{}
-			r.determineOverallHealth(instance, tc.conditions)
-
-			if instance.Status.Phase != tc.wantPhase {
-				t.Errorf("phase = %q, want %q", instance.Status.Phase, tc.wantPhase)
+			var replicas int32
+			if tc.ready {
+				replicas = 1
 			}
-			if instance.Status.Ready != tc.wantReady {
-				t.Errorf("ready = %v, want %v", instance.Status.Ready, tc.wantReady)
+			instance.Status.Web = &v1alpha1.ComponentStatus{ReadyReplicas: replicas, Issues: tc.issues}
+			instance.Status.Worker = &v1alpha1.WorkerComponentStatus{
+				ComponentStatus: v1alpha1.ComponentStatus{ReadyReplicas: replicas},
+			}
+
+			phase, ready := derivePhase(instance)
+			if phase != tc.wantPhase {
+				t.Errorf("phase = %q, want %q", phase, tc.wantPhase)
+			}
+			if ready != tc.wantReady {
+				t.Errorf("ready = %v, want %v", ready, tc.wantReady)
 			}
 		})
 	}

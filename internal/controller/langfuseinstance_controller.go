@@ -354,23 +354,7 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance 
 		}
 	}
 
-	// Determine readiness — in Phase 1 just check if deployments exist
-	webReady := instance.Status.Web != nil && instance.Status.Web.ReadyReplicas > 0
-	workerReady := instance.Status.Worker != nil && instance.Status.Worker.ReadyReplicas > 0
-
-	switch {
-	case webReady && workerReady:
-		instance.Status.Phase = phaseRunning
-		instance.Status.Ready = true
-	case instanceHasFatalPodIssue(instance):
-		// A bad image or a missing Secret key never resolves on its own, so
-		// report Error instead of leaving the instance in Pending forever.
-		instance.Status.Phase = phaseError
-		instance.Status.Ready = false
-	default:
-		instance.Status.Phase = phasePending
-		instance.Status.Ready = false
-	}
+	instance.Status.Phase, instance.Status.Ready = derivePhase(instance)
 
 	instance.Status.Version = instance.Spec.Image.Tag
 	instance.Status.PublicUrl = instance.Spec.Auth.NextAuthUrl

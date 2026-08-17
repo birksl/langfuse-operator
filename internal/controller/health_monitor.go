@@ -84,8 +84,8 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Pending is deliberately NOT skipped: a first rollout that never comes up
 	// (bad image, missing Secret key) sits in Pending forever, and that is
 	// exactly when the user needs the pod-level diagnosis below.
-	if instance.Status.Phase == phaseMigrating {
-		log.V(1).Info("skipping health check during migration", "phase", instance.Status.Phase)
+	if migrationRunning(instance) {
+		log.V(1).Info("skipping health check during migration")
 		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
 	}
 
@@ -115,17 +115,8 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	workerCondition := r.checkWorkerDeployment(ctx, instance)
 	r.applyCondition(instance, workerCondition)
 
-	// 9. Determine overall health.
-	r.determineOverallHealth(instance, []metav1.Condition{
-		dbCondition,
-		chCondition,
-		redisCondition,
-		blobCondition,
-		webCondition,
-		workerCondition,
-	})
-
-	// 10. Update status.
+	// 9. Update status. Phase and readiness are owned by the instance
+	// controller, which derives them from the conditions set above.
 	if err := r.Status().Update(ctx, instance); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating health status: %w", err)
 	}
@@ -299,35 +290,6 @@ func (r *HealthMonitorReconciler) applyCondition(instance *v1alpha1.LangfuseInst
 	meta.SetStatusCondition(&instance.Status.Conditions, condition)
 }
 
-// determineOverallHealth sets the instance phase based on component conditions.
-// Critical components are Database, ClickHouse, Redis, Web, and Worker.
-// BlobStorage is only critical if explicitly configured.
-//
-// A fatal pod issue (bad image reference, missing Secret key) reports Error
-// rather than Degraded: Degraded implies the instance may recover on its own,
-// whereas these need the user to change something.
-func (r *HealthMonitorReconciler) determineOverallHealth(instance *v1alpha1.LangfuseInstance, conditions []metav1.Condition) {
-	allReady := true
-	for _, c := range conditions {
-		if c.Status != metav1.ConditionTrue {
-			allReady = false
-			break
-		}
-	}
-
-	switch {
-	case allReady:
-		instance.Status.Phase = phaseRunning
-		instance.Status.Ready = true
-	case instanceHasFatalPodIssue(instance):
-		instance.Status.Phase = phaseError
-		instance.Status.Ready = false
-	default:
-		instance.Status.Phase = phaseDegraded
-		instance.Status.Ready = false
-	}
-}
-
 // instanceHasFatalPodIssue reports whether any component has a pod issue that
 // requires human intervention.
 func instanceHasFatalPodIssue(instance *v1alpha1.LangfuseInstance) bool {
@@ -335,6 +297,9 @@ func instanceHasFatalPodIssue(instance *v1alpha1.LangfuseInstance) bool {
 		return true
 	}
 	if instance.Status.Worker != nil && hasFatalIssue(instance.Status.Worker.Issues) {
+		return true
+	}
+	if instance.Status.Migration != nil && hasFatalIssue(instance.Status.Migration.Issues) {
 		return true
 	}
 	return false
