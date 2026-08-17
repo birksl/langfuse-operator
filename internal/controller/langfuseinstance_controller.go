@@ -105,12 +105,11 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. Set initial phase
 	if instance.Status.Phase == "" {
 		instance.Status.Phase = phasePending
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("setting initial phase: %w", err)
-		}
 	}
 
 	// 3. Build env var config
@@ -123,7 +122,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			Message:            err.Error(),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 		return ctrl.Result{}, fmt.Errorf("building config: %w", err)
@@ -181,7 +180,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// 14. Update status
-	if err := r.updateStatus(ctx, instance); err != nil {
+	if err := r.updateStatus(ctx, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
@@ -323,7 +322,7 @@ func (r *LangfuseInstanceReconciler) reconcileService(ctx context.Context, insta
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance *v1alpha1.LangfuseInstance) error {
+func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance, original *v1alpha1.LangfuseInstance) error {
 	// Fetch current deployment states
 	webDeploy := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: resources.WebName(instance), Namespace: instance.Namespace}, webDeploy); err != nil {
@@ -367,7 +366,7 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance 
 		ObservedGeneration: instance.Generation,
 	})
 
-	return r.Status().Update(ctx, instance)
+	return updateInstanceStatus(ctx, r.Client, instance, original)
 }
 
 // setDeprecationCondition flags spec fields scheduled for removal. Managed

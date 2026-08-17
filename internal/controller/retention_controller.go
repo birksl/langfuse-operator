@@ -75,6 +75,8 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. If ClickHouse retention is not configured, skip
 	if instance.Spec.ClickHouse == nil || instance.Spec.ClickHouse.Retention == nil {
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
@@ -84,7 +86,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 			Message:            "No ClickHouse retention policy configured",
 			ObservedGeneration: instance.Generation,
 		})
-		if err := r.Status().Update(ctx, instance); err != nil {
+		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating retention status: %w", err)
 		}
 		return ctrl.Result{RequeueAfter: retentionRequeueInterval}, nil
@@ -140,7 +142,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.evaluateStoragePressure(ctx, instance, retention.StoragePressure)
 	}
 
-	if err := r.Status().Update(ctx, instance); err != nil {
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating retention status: %w", err)
 	}
 

@@ -79,6 +79,8 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. Skip dependency probes while a migration is running — the stores are
 	// intentionally in flux and the migration controller owns the phase.
 	// Pending is deliberately NOT skipped: a first rollout that never comes up
@@ -117,7 +119,7 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 9. Update status. Phase and readiness are owned by the instance
 	// controller, which derives them from the conditions set above.
-	if err := r.Status().Update(ctx, instance); err != nil {
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating health status: %w", err)
 	}
 

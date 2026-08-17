@@ -61,6 +61,8 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. Determine check interval
 	checkInterval := defaultSchemaDriftCheckIntervalMinutes
 	if instance.Spec.ClickHouse != nil &&
@@ -81,7 +83,7 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 			Message:            "Schema drift detection is disabled",
 			ObservedGeneration: instance.Generation,
 		})
-		if err := r.Status().Update(ctx, instance); err != nil {
+		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating schema drift status: %w", err)
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -144,7 +146,7 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 		})
 	}
 
-	if err := r.Status().Update(ctx, instance); err != nil {
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating schema drift status: %w", err)
 	}
 

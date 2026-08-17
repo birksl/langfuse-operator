@@ -64,6 +64,8 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// Skip if migration is disabled
 	if instance.Spec.Database != nil && instance.Spec.Database.Migration != nil &&
 		instance.Spec.Database.Migration.RunOnDeploy != nil && !*instance.Spec.Database.Migration.RunOnDeploy {
@@ -104,7 +106,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			Message:            fmt.Sprintf("Running migrations for version %s", desiredTag),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 
@@ -134,7 +136,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			instance.Status.Database = &v1alpha1.DatabaseStatus{}
 		}
 		instance.Status.Database.MigrationVersion = langfuse.NormalizeVersion(desiredTag)
-		if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 		r.Recorder.Eventf(instance, "Normal", "MigrationCompleted",
@@ -168,7 +170,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 				Message:            message,
 				ObservedGeneration: instance.Generation,
 			})
-			if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+			if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 				log.Error(statusErr, "failed to update status")
 			}
 			r.Recorder.Eventf(instance, "Warning", "MigrationFailed",
@@ -191,7 +193,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			ObservedGeneration: instance.Generation,
 		})
 	}
-	if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+	if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 		log.Error(statusErr, "failed to update status")
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil

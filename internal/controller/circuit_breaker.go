@@ -91,6 +91,8 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 3. Initialize in-memory maps if nil
 	if r.failureCounts == nil {
 		r.failureCounts = make(map[string]map[string]int)
@@ -122,7 +124,6 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 		{name: "database", spec: cb.Database, probe: probeDatabase},
 	}
 
-	statusChanged := false
 	for _, comp := range components {
 		if comp.spec == nil {
 			continue
@@ -161,12 +162,8 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 
 			// Check if we're recovering from an open circuit
 			if previousFailures >= threshold {
-				changed, err := r.recoverCircuitBreaker(ctx, instance, instanceKey, comp.name, comp.spec)
-				if err != nil {
+				if err := r.recoverCircuitBreaker(ctx, instance, instanceKey, comp.name, comp.spec); err != nil {
 					log.Error(err, "failed to recover circuit breaker", "component", comp.name)
-				}
-				if changed {
-					statusChanged = true
 				}
 			}
 		} else {
@@ -175,12 +172,8 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 			count := r.failureCounts[instanceKey][comp.name]
 
 			if count >= threshold {
-				changed, err := r.openCircuitBreaker(ctx, instance, instanceKey, comp.name, comp.spec)
-				if err != nil {
+				if err := r.openCircuitBreaker(ctx, instance, instanceKey, comp.name, comp.spec); err != nil {
 					log.Error(err, "failed to open circuit breaker", "component", comp.name)
-				}
-				if changed {
-					statusChanged = true
 				}
 			}
 		}
@@ -195,22 +188,15 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 		ObservedGeneration: instance.Generation,
 	})
 
-	if statusChanged {
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating circuit breaker status: %w", err)
-		}
-	} else {
-		// Still update conditions even if no circuit state changed
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating circuit breaker status: %w", err)
-		}
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating circuit breaker status: %w", err)
 	}
 
 	return ctrl.Result{RequeueAfter: shortestInterval}, nil
 }
 
 // openCircuitBreaker takes the configured action when the failure threshold is reached.
-func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, instance *v1alpha1.LangfuseInstance, instanceKey, component string, spec *v1alpha1.ComponentCircuitBreakerSpec) (bool, error) {
+func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, instance *v1alpha1.LangfuseInstance, instanceKey, component string, spec *v1alpha1.ComponentCircuitBreakerSpec) error {
 	log := logf.FromContext(ctx)
 
 	if spec.Action != "scaleWorkerToZero" {
@@ -218,12 +204,12 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 			r.Recorder.Eventf(instance, "Warning", "CircuitBreakerOpen",
 				"Circuit breaker opened for %s: dependency unhealthy", component)
 		}
-		return false, nil
+		return nil
 	}
 
 	// Check if already tripped
 	if instance.Status.Worker != nil && instance.Status.Worker.CircuitBreakerActive {
-		return false, nil
+		return nil
 	}
 
 	// Save current worker replica count
@@ -231,9 +217,9 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 	workerKey := types.NamespacedName{Name: resources.WorkerName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, workerKey, workerDeploy); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return nil
 		}
-		return false, fmt.Errorf("getting worker deployment: %w", err)
+		return fmt.Errorf("getting worker deployment: %w", err)
 	}
 
 	currentReplicas := int32(1)
@@ -247,7 +233,7 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 	patch := client.MergeFrom(workerDeploy.DeepCopy())
 	workerDeploy.Spec.Replicas = &zero
 	if err := r.Patch(ctx, workerDeploy, patch); err != nil {
-		return false, fmt.Errorf("scaling worker to zero: %w", err)
+		return fmt.Errorf("scaling worker to zero: %w", err)
 	}
 
 	log.Info("circuit breaker opened: scaled worker to 0",
@@ -266,11 +252,11 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 		"Scaled worker to 0: %s dependency unhealthy (failures=%d)",
 		component, r.failureCounts[instanceKey][component])
 
-	return true, nil
+	return nil
 }
 
 // recoverCircuitBreaker restores the component after recovery.
-func (r *CircuitBreakerController) recoverCircuitBreaker(ctx context.Context, instance *v1alpha1.LangfuseInstance, instanceKey, component string, spec *v1alpha1.ComponentCircuitBreakerSpec) (bool, error) {
+func (r *CircuitBreakerController) recoverCircuitBreaker(ctx context.Context, instance *v1alpha1.LangfuseInstance, instanceKey, component string, spec *v1alpha1.ComponentCircuitBreakerSpec) error {
 	log := logf.FromContext(ctx)
 
 	if spec.Action != "scaleWorkerToZero" || spec.RecoveryAction != "restoreScale" {
@@ -278,7 +264,7 @@ func (r *CircuitBreakerController) recoverCircuitBreaker(ctx context.Context, in
 			r.Recorder.Eventf(instance, "Normal", "CircuitBreakerClosed",
 				"Circuit breaker closed for %s: dependency recovered", component)
 		}
-		return false, nil
+		return nil
 	}
 
 	// Restore saved replica count
@@ -291,15 +277,15 @@ func (r *CircuitBreakerController) recoverCircuitBreaker(ctx context.Context, in
 	workerKey := types.NamespacedName{Name: resources.WorkerName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, workerKey, workerDeploy); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return nil
 		}
-		return false, fmt.Errorf("getting worker deployment for recovery: %w", err)
+		return fmt.Errorf("getting worker deployment for recovery: %w", err)
 	}
 
 	patch := client.MergeFrom(workerDeploy.DeepCopy())
 	workerDeploy.Spec.Replicas = &savedReplicas
 	if err := r.Patch(ctx, workerDeploy, patch); err != nil {
-		return false, fmt.Errorf("restoring worker replicas: %w", err)
+		return fmt.Errorf("restoring worker replicas: %w", err)
 	}
 
 	log.Info("circuit breaker closed: restored worker replicas",
@@ -321,7 +307,7 @@ func (r *CircuitBreakerController) recoverCircuitBreaker(ctx context.Context, in
 		"Restored worker to %d replicas: %s dependency recovered",
 		savedReplicas, component)
 
-	return true, nil
+	return nil
 }
 
 func isCircuitBreakerActive(instance *v1alpha1.LangfuseInstance) bool {
