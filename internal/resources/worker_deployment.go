@@ -25,15 +25,16 @@ import (
 	"github.com/PalenaAI/langfuse-operator/internal/langfuse"
 )
 
+// circuitBreakerHoldsWorker reports whether the circuit breaker has scaled the
+// worker down and therefore owns its replica count.
+func circuitBreakerHoldsWorker(instance *v1alpha1.LangfuseInstance) bool {
+	return instance.Status.Worker != nil && instance.Status.Worker.CircuitBreakerActive
+}
+
 // BuildWorkerDeployment constructs the desired Deployment for the Langfuse Worker component.
 func BuildWorkerDeployment(instance *v1alpha1.LangfuseInstance, config *langfuse.Config) *appsv1.Deployment {
 	labels := CommonLabels(instance, "worker")
 	selectorLabels := SelectorLabels(instance, "worker")
-
-	replicas := int32(1)
-	if instance.Spec.Worker.Replicas != nil {
-		replicas = *instance.Spec.Worker.Replicas
-	}
 
 	envVars := mergeEnv(config.CommonEnv, config.WorkerEnv, instance.Spec.Worker.ExtraEnv)
 
@@ -80,7 +81,8 @@ func BuildWorkerDeployment(instance *v1alpha1.LangfuseInstance, config *langfuse
 			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
+			Replicas: ownedReplicas(instance.Spec.Worker.Replicas, instance.Spec.Worker.Autoscaling,
+				circuitBreakerHoldsWorker(instance)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: selectorLabels,
 			},

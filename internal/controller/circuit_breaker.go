@@ -209,12 +209,6 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 		return nil
 	}
 
-	// Check if already tripped
-	if instance.Status.Worker != nil && instance.Status.Worker.CircuitBreakerActive {
-		return nil
-	}
-
-	// Save current worker replica count
 	workerDeploy := &appsv1.Deployment{}
 	workerKey := types.NamespacedName{Name: resources.WorkerName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, workerKey, workerDeploy); err != nil {
@@ -228,7 +222,23 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 	if workerDeploy.Spec.Replicas != nil {
 		currentReplicas = *workerDeploy.Spec.Replicas
 	}
-	r.savedReplicas[instanceKey][component] = currentReplicas
+
+	// Trust the observed scale, not just the flag. Between the patch below and
+	// the status write at the end of Reconcile, the instance controller can
+	// reconcile with a copy that has no flag yet and scale the worker back up;
+	// keying "already tripped" off the flag alone would leave the breaker
+	// believing it had acted while the worker ran on. Re-asserting zero makes a
+	// lost race self-heal on the next probe.
+	alreadyTripped := instance.Status.Worker != nil && instance.Status.Worker.CircuitBreakerActive
+	if alreadyTripped && currentReplicas == 0 {
+		return nil
+	}
+
+	// Only capture the restore point on the opening transition, or a re-assert
+	// would save 0 and recovery would restore nothing.
+	if !alreadyTripped {
+		r.savedReplicas[instanceKey][component] = currentReplicas
+	}
 
 	// Scale worker to 0
 	zero := int32(0)
@@ -240,7 +250,8 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 
 	log.Info("circuit breaker opened: scaled worker to 0",
 		"component", component,
-		"savedReplicas", currentReplicas,
+		"savedReplicas", r.savedReplicas[instanceKey][component],
+		"reasserted", alreadyTripped,
 	)
 
 	// Update worker status
@@ -250,9 +261,12 @@ func (r *CircuitBreakerController) openCircuitBreaker(ctx context.Context, insta
 	instance.Status.Worker.CircuitBreakerActive = true
 	instance.Status.Worker.CircuitBreakerReason = fmt.Sprintf("%s dependency unhealthy", component)
 
-	r.Recorder.Eventf(instance, "Warning", "CircuitBreakerOpen",
-		"Scaled worker to 0: %s dependency unhealthy (failures=%d)",
-		component, r.failureCounts[instanceKey][component])
+	// Only on the transition — a re-assert would spam the event stream.
+	if !alreadyTripped {
+		r.Recorder.Eventf(instance, "Warning", "CircuitBreakerOpen",
+			"Scaled worker to 0: %s dependency unhealthy (failures=%d)",
+			component, r.failureCounts[instanceKey][component])
+	}
 
 	return nil
 }

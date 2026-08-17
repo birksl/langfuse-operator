@@ -135,6 +135,39 @@ func TestBuildWebDeployment_CustomReplicas(t *testing.T) {
 	}
 }
 
+// Replicas must be left unset once an HPA owns the count, otherwise every
+// reconcile reverts whatever the autoscaler decided.
+func TestBuildWebDeployment_RelinquishesReplicasToHPA(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.Web.Replicas = ptrInt32(3)
+	instance.Spec.Web.Autoscaling = &v1alpha1.AutoscalingSpec{Enabled: true, MaxReplicas: 5}
+
+	deploy := BuildWebDeployment(instance, buildConfig(instance))
+
+	if deploy.Spec.Replicas != nil {
+		t.Errorf("replicas = %d, want nil when autoscaling is enabled", *deploy.Spec.Replicas)
+	}
+}
+
+func TestBuildWorkerDeployment_RelinquishesReplicasToCircuitBreaker(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.Worker.Replicas = ptrInt32(2)
+	instance.Status.Worker = &v1alpha1.WorkerComponentStatus{CircuitBreakerActive: true}
+
+	deploy := BuildWorkerDeployment(instance, buildConfig(instance))
+
+	if deploy.Spec.Replicas != nil {
+		t.Errorf("replicas = %d, want nil while the circuit breaker is open", *deploy.Spec.Replicas)
+	}
+
+	// Once the breaker closes, the operator owns the count again.
+	instance.Status.Worker.CircuitBreakerActive = false
+	deploy = BuildWorkerDeployment(instance, buildConfig(instance))
+	if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 2 {
+		t.Errorf("replicas = %v, want 2 after the breaker closes", deploy.Spec.Replicas)
+	}
+}
+
 func TestBuildWebDeployment_Resources(t *testing.T) {
 	instance := minimalInstance()
 	instance.Spec.Web.Resources = &v1alpha1.ResourceRequirements{

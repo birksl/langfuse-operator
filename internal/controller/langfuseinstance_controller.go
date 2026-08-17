@@ -267,6 +267,13 @@ func (r *LangfuseInstanceReconciler) reconcileDeployment(ctx context.Context, in
 	// spawn a fresh ReplicaSet on each flip.
 	preservePodTemplateAnnotations(existing, desired)
 
+	// A nil Replicas means another controller owns the count (HPA, or the
+	// circuit breaker holding the worker at zero). Carry the live value forward
+	// rather than letting the write reset it.
+	if desired.Spec.Replicas == nil {
+		desired.Spec.Replicas = existing.Spec.Replicas
+	}
+
 	// Update if spec changed
 	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
 		existing.Spec = desired.Spec
