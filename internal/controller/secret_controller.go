@@ -46,7 +46,11 @@ import (
 const (
 	secretHashAnnotation  = "langfuse.palena.ai/secret-hash"
 	generatedSecretSuffix = "-generated-secrets"
-	alphanumericCharset   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	// fieldOwnerSecrets keeps this controller's pod-template annotation out of
+	// the instance controller's apply set. See fieldOwnerInstance.
+	fieldOwnerSecrets   = "langfuse-operator-secrets"
+	alphanumericCharset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 // SecretController reconciles Secrets for LangfuseInstance objects.
@@ -378,7 +382,10 @@ func (r *SecretController) patchDeploymentSecretHash(ctx context.Context, instan
 	}
 	deploy.Spec.Template.Annotations[secretHashAnnotation] = newHash
 
-	if err := r.Patch(ctx, deploy, patch); err != nil {
+	// Distinct field owner: the instance controller server-side applies these
+	// Deployments without declaring this annotation, and SSA only prunes fields
+	// the applying manager owns.
+	if err := r.Patch(ctx, deploy, patch, client.FieldOwner(fieldOwnerSecrets)); err != nil {
 		return false, fmt.Errorf("patching deployment %s: %w", deployName, err)
 	}
 

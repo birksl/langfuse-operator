@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -59,6 +59,11 @@ const (
 	// conditionTypeDeprecated warns that the spec uses fields scheduled for
 	// removal, so users find out from the CR rather than from a failed upgrade.
 	conditionTypeDeprecated = "Deprecated"
+
+	// fieldOwnerInstance identifies this controller in managedFields. Sibling
+	// controllers must use a different owner, or server-side apply prunes the
+	// fields they set but this one does not declare.
+	fieldOwnerInstance = "langfuse-operator"
 )
 
 // LangfuseInstanceReconciler reconciles a LangfuseInstance object
@@ -152,21 +157,21 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// 4. Reconcile Web Deployment
 	webDeploy := resources.BuildWebDeployment(instance, config)
-	if err := r.reconcileDeployment(ctx, instance, webDeploy); err != nil {
+	if err := r.apply(ctx, instance, webDeploy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling web deployment: %w", err)
 	}
 	log.Info("reconciled web deployment", "name", webDeploy.Name)
 
 	// 5. Reconcile Web Service
 	webSvc := resources.BuildWebService(instance)
-	if err := r.reconcileService(ctx, instance, webSvc); err != nil {
+	if err := r.apply(ctx, instance, webSvc); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling web service: %w", err)
 	}
 	log.Info("reconciled web service", "name", webSvc.Name)
 
 	// 6. Reconcile Worker Deployment
 	workerDeploy := resources.BuildWorkerDeployment(instance, config)
-	if err := r.reconcileDeployment(ctx, instance, workerDeploy); err != nil {
+	if err := r.apply(ctx, instance, workerDeploy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling worker deployment: %w", err)
 	}
 	log.Info("reconciled worker deployment", "name", workerDeploy.Name)
@@ -198,7 +203,7 @@ func (r *LangfuseInstanceReconciler) reconcileNetworking(ctx context.Context, in
 
 	if instance.Spec.Ingress != nil && instance.Spec.Ingress.Enabled {
 		ingress := resources.BuildIngress(instance)
-		if err := r.reconcileIngress(ctx, instance, ingress); err != nil {
+		if err := r.apply(ctx, instance, ingress); err != nil {
 			return fmt.Errorf("reconciling ingress: %w", err)
 		}
 		log.Info("reconciled ingress", "name", ingress.Name)
@@ -206,7 +211,7 @@ func (r *LangfuseInstanceReconciler) reconcileNetworking(ctx context.Context, in
 
 	if instance.Spec.Route != nil && instance.Spec.Route.Enabled {
 		route := resources.BuildRoute(instance)
-		if err := r.reconcileUnstructured(ctx, instance, route); err != nil {
+		if err := r.apply(ctx, instance, route); err != nil {
 			return fmt.Errorf("reconciling route: %w", err)
 		}
 		log.Info("reconciled openshift route", "name", route.GetName())
@@ -214,7 +219,7 @@ func (r *LangfuseInstanceReconciler) reconcileNetworking(ctx context.Context, in
 
 	if instance.Spec.GatewayAPI != nil && instance.Spec.GatewayAPI.Enabled {
 		httpRoute := resources.BuildHTTPRoute(instance)
-		if err := r.reconcileUnstructured(ctx, instance, httpRoute); err != nil {
+		if err := r.apply(ctx, instance, httpRoute); err != nil {
 			return fmt.Errorf("reconciling httproute: %w", err)
 		}
 		log.Info("reconciled httproute", "name", httpRoute.GetName())
@@ -237,7 +242,7 @@ func (r *LangfuseInstanceReconciler) reconcilePlatform(ctx context.Context, inst
 	if instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil &&
 		instance.Spec.Observability.ServiceMonitor.Enabled {
 		sm := resources.BuildServiceMonitor(instance)
-		if err := r.reconcileUnstructured(ctx, instance, sm); err != nil {
+		if err := r.apply(ctx, instance, sm); err != nil {
 			return fmt.Errorf("reconciling servicemonitor: %w", err)
 		}
 		log.Info("reconciled servicemonitor", "name", sm.GetName())
@@ -246,88 +251,30 @@ func (r *LangfuseInstanceReconciler) reconcilePlatform(ctx context.Context, inst
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) reconcileDeployment(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *appsv1.Deployment) error {
+// apply server-side applies desired, declaring only the fields the operator
+// owns. Anything it does not set — API-server defaults, an HPA's replicas,
+// annotations written by sibling controllers — is left alone. The previous
+// read-then-DeepEqual-then-overwrite pattern compared a freshly built spec
+// against a defaulted one, so it always saw a difference and rewrote the object
+// on every pass.
+func (r *LangfuseInstanceReconciler) apply(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired client.Object) error {
 	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
 		return fmt.Errorf("setting owner reference: %w", err)
 	}
 
-	existing := &appsv1.Deployment{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
+	// Apply patches are rejected without apiVersion/kind, which the builders
+	// leave off typed objects.
+	gvk, err := apiutil.GVKForObject(desired, r.Scheme)
 	if err != nil {
-		return fmt.Errorf("getting deployment: %w", err)
+		return fmt.Errorf("resolving GVK for %T: %w", desired, err)
 	}
+	desired.GetObjectKind().SetGroupVersionKind(gvk)
 
-	// Other controllers (secret_controller in particular) patch
-	// `langfuse.palena.ai/*` annotations onto the pod template to drive
-	// rolling restarts. Carry those forward so the DeepEqual comparison
-	// stays stable; otherwise the two controllers fight every reconcile and
-	// spawn a fresh ReplicaSet on each flip.
-	preservePodTemplateAnnotations(existing, desired)
-
-	// A nil Replicas means another controller owns the count (HPA, or the
-	// circuit breaker holding the worker at zero). Carry the live value forward
-	// rather than letting the write reset it.
-	if desired.Spec.Replicas == nil {
-		desired.Spec.Replicas = existing.Spec.Replicas
+	// ForceOwnership takes over fields still attributed to the pre-SSA manager.
+	if err := r.Patch(ctx, desired, client.Apply,
+		client.FieldOwner(fieldOwnerInstance), client.ForceOwnership); err != nil {
+		return fmt.Errorf("applying %s %s: %w", gvk.Kind, desired.GetName(), err)
 	}
-
-	// Update if spec changed
-	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		existing.Spec = desired.Spec
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
-// preservePodTemplateAnnotations copies operator-namespaced pod-template
-// annotations from the live Deployment onto the desired one, so that
-// annotations written by sibling controllers survive subsequent reconciles.
-func preservePodTemplateAnnotations(existing, desired *appsv1.Deployment) {
-	if existing.Spec.Template.Annotations == nil {
-		return
-	}
-	if desired.Spec.Template.Annotations == nil {
-		desired.Spec.Template.Annotations = map[string]string{}
-	}
-	for k, v := range existing.Spec.Template.Annotations {
-		if !strings.HasPrefix(k, "langfuse.palena.ai/") {
-			continue
-		}
-		if _, alreadySet := desired.Spec.Template.Annotations[k]; alreadySet {
-			continue
-		}
-		desired.Spec.Template.Annotations[k] = v
-	}
-}
-
-func (r *LangfuseInstanceReconciler) reconcileService(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *corev1.Service) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &corev1.Service{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting service: %w", err)
-	}
-
-	// Update if spec changed (preserve ClusterIP)
-	if !equality.Semantic.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) ||
-		!equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
-		existing.Spec.Ports = desired.Spec.Ports
-		existing.Spec.Selector = desired.Spec.Selector
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
 	return nil
 }
 
@@ -476,13 +423,13 @@ func (r *LangfuseInstanceReconciler) reconcileNetworkPolicies(ctx context.Contex
 	}
 
 	webNetpol := resources.BuildWebNetworkPolicy(instance)
-	if err := r.reconcileNetworkPolicy(ctx, instance, webNetpol); err != nil {
+	if err := r.apply(ctx, instance, webNetpol); err != nil {
 		return fmt.Errorf("web network policy: %w", err)
 	}
 	log.Info("reconciled web network policy", "name", webNetpol.Name)
 
 	workerNetpol := resources.BuildWorkerNetworkPolicy(instance)
-	if err := r.reconcileNetworkPolicy(ctx, instance, workerNetpol); err != nil {
+	if err := r.apply(ctx, instance, workerNetpol); err != nil {
 		return fmt.Errorf("worker network policy: %w", err)
 	}
 	log.Info("reconciled worker network policy", "name", workerNetpol.Name)
@@ -490,96 +437,20 @@ func (r *LangfuseInstanceReconciler) reconcileNetworkPolicies(ctx context.Contex
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) reconcileIngress(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *networkingv1.Ingress) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &networkingv1.Ingress{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting ingress: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) ||
-		!equality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
-		existing.Spec = desired.Spec
-		existing.Labels = desired.Labels
-		existing.Annotations = desired.Annotations
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
-func (r *LangfuseInstanceReconciler) reconcileUnstructured(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *unstructured.Unstructured) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(desired.GroupVersionKind())
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting %s: %w", desired.GetKind(), err)
-	}
-
-	// Update spec if changed
-	desiredSpec := desired.Object["spec"]
-	existingSpec := existing.Object["spec"]
-	if !equality.Semantic.DeepEqual(existingSpec, desiredSpec) {
-		existing.Object["spec"] = desiredSpec
-		existing.SetLabels(desired.GetLabels())
-		existing.SetAnnotations(desired.GetAnnotations())
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
-func (r *LangfuseInstanceReconciler) reconcileNetworkPolicy(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *networkingv1.NetworkPolicy) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting network policy: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		existing.Spec = desired.Spec
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
 func (r *LangfuseInstanceReconciler) reconcileClickHouse(ctx context.Context, instance *v1alpha1.LangfuseInstance) error {
 	// ConfigMap
 	cm := resources.BuildClickHouseConfigMap(instance)
-	if err := r.reconcileConfigMap(ctx, instance, cm); err != nil {
+	if err := r.apply(ctx, instance, cm); err != nil {
 		return fmt.Errorf("clickhouse configmap: %w", err)
 	}
 	// Service
 	svc := resources.BuildClickHouseService(instance)
-	if err := r.reconcileService(ctx, instance, svc); err != nil {
+	if err := r.apply(ctx, instance, svc); err != nil {
 		return fmt.Errorf("clickhouse service: %w", err)
 	}
 	// StatefulSet
 	sts := resources.BuildClickHouseStatefulSet(instance)
-	if err := r.reconcileStatefulSet(ctx, instance, sts); err != nil {
+	if err := r.apply(ctx, instance, sts); err != nil {
 		return fmt.Errorf("clickhouse statefulset: %w", err)
 	}
 	return nil
@@ -588,62 +459,14 @@ func (r *LangfuseInstanceReconciler) reconcileClickHouse(ctx context.Context, in
 func (r *LangfuseInstanceReconciler) reconcileRedis(ctx context.Context, instance *v1alpha1.LangfuseInstance) error {
 	// Service
 	svc := resources.BuildRedisService(instance)
-	if err := r.reconcileService(ctx, instance, svc); err != nil {
+	if err := r.apply(ctx, instance, svc); err != nil {
 		return fmt.Errorf("redis service: %w", err)
 	}
 	// StatefulSet
 	sts := resources.BuildRedisStatefulSet(instance)
-	if err := r.reconcileStatefulSet(ctx, instance, sts); err != nil {
+	if err := r.apply(ctx, instance, sts); err != nil {
 		return fmt.Errorf("redis statefulset: %w", err)
 	}
-	return nil
-}
-
-func (r *LangfuseInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *appsv1.StatefulSet) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &appsv1.StatefulSet{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting statefulset: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) ||
-		!equality.Semantic.DeepEqual(existing.Spec.Replicas, desired.Spec.Replicas) {
-		existing.Spec.Template = desired.Spec.Template
-		existing.Spec.Replicas = desired.Spec.Replicas
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
-func (r *LangfuseInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *corev1.ConfigMap) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting configmap: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Data, desired.Data) {
-		existing.Data = desired.Data
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
 	return nil
 }
 
@@ -651,40 +474,17 @@ func (r *LangfuseInstanceReconciler) reconcileHPAs(ctx context.Context, instance
 	// Web HPA
 	if instance.Spec.Web.Autoscaling != nil && instance.Spec.Web.Autoscaling.Enabled {
 		hpa := resources.BuildWebHPA(instance)
-		if err := r.reconcileHPA(ctx, instance, hpa); err != nil {
+		if err := r.apply(ctx, instance, hpa); err != nil {
 			return fmt.Errorf("web HPA: %w", err)
 		}
 	}
 	// Worker HPA
 	if instance.Spec.Worker.Autoscaling != nil && instance.Spec.Worker.Autoscaling.Enabled {
 		hpa := resources.BuildWorkerHPA(instance)
-		if err := r.reconcileHPA(ctx, instance, hpa); err != nil {
+		if err := r.apply(ctx, instance, hpa); err != nil {
 			return fmt.Errorf("worker HPA: %w", err)
 		}
 	}
-	return nil
-}
-
-func (r *LangfuseInstanceReconciler) reconcileHPA(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *autoscalingv2.HorizontalPodAutoscaler) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &autoscalingv2.HorizontalPodAutoscaler{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting HPA: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		existing.Spec = desired.Spec
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
 	return nil
 }
 
@@ -692,44 +492,20 @@ func (r *LangfuseInstanceReconciler) reconcilePDBs(ctx context.Context, instance
 	// Web PDB
 	if instance.Spec.Web.PodDisruptionBudget != nil && instance.Spec.Web.PodDisruptionBudget.Enabled {
 		pdb := resources.BuildWebPDB(instance)
-		if err := r.reconcilePDB(ctx, instance, pdb); err != nil {
+		if err := r.apply(ctx, instance, pdb); err != nil {
 			return fmt.Errorf("web PDB: %w", err)
 		}
 	}
 	// Worker PDB
 	if instance.Spec.Worker.PodDisruptionBudget != nil && instance.Spec.Worker.PodDisruptionBudget.Enabled {
 		pdb := resources.BuildWorkerPDB(instance)
-		if err := r.reconcilePDB(ctx, instance, pdb); err != nil {
+		if err := r.apply(ctx, instance, pdb); err != nil {
 			return fmt.Errorf("worker PDB: %w", err)
 		}
 	}
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) reconcilePDB(ctx context.Context, instance *v1alpha1.LangfuseInstance, desired *policyv1.PodDisruptionBudget) error {
-	if err := controllerutil.SetControllerReference(instance, desired, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
-
-	existing := &policyv1.PodDisruptionBudget{}
-	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("getting PDB: %w", err)
-	}
-
-	if !equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		existing.Spec = desired.Spec
-		existing.Labels = desired.Labels
-		return r.Update(ctx, existing)
-	}
-
-	return nil
-}
-
-// SetupWithManager sets up the controller with the Manager.
 func (r *LangfuseInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// driftOnly suppresses status-only events from children the operator writes
 	// but never reads. Deployment is deliberately absent: derivePhase needs its

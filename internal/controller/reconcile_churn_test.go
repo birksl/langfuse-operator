@@ -61,6 +61,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -749,13 +750,13 @@ var _ = Describe("Reconcile churn", func() {
 
 	// ─── H5: builders vs. API-server defaulting ──────────────────────────────
 
-	Describe("H5: change detection against a defaulted object", func() {
+	Describe("H5: change detection and field ownership", func() {
 		const (
 			namespace = "churn-h5"
 			name      = "churn"
 		)
 
-		It("finds the live Deployment spec equal to the desired one", func() {
+		It("leaves Deployment fields owned by another manager alone", func() {
 			ns := newChurnNamespace(namespace)
 
 			startChurnManager(func(mgr ctrl.Manager) error {
@@ -768,31 +769,47 @@ var _ = Describe("Reconcile churn", func() {
 			Expect(k8sClient.Create(context.Background(), instance)).To(Succeed())
 
 			webName := resources.WebName(instance)
+			webKey := types.NamespacedName{Name: webName, Namespace: ns}
 			live := &appsv1.Deployment{}
 			Eventually(func() error {
-				return k8sClient.Get(context.Background(),
-					types.NamespacedName{Name: webName, Namespace: ns}, live)
+				return k8sClient.Get(context.Background(), webKey, live)
 			}, "30s").Should(Succeed(), "web deployment should be created")
 
-			// Rebuild the desired object exactly as reconcileDeployment does, then
-			// run the same comparison it gates its Update on. Anything the builder
-			// leaves unset but the API server defaults shows up here as a
-			// permanent difference, so the gate opens on every single pass.
+			// Diagnostic, not an assertion: the fields the builders omit and the
+			// API server defaults. Under a full-spec DeepEqual these made the
+			// change-detection gate open on every pass; server-side apply never
+			// looks at them, because the operator does not declare them.
 			Expect(k8sClient.Get(context.Background(),
 				types.NamespacedName{Name: name, Namespace: ns}, instance)).To(Succeed())
 			config, err := langfuse.BuildConfig(instance)
 			Expect(err).NotTo(HaveOccurred())
-			desired := resources.BuildWebDeployment(instance, config)
-			preservePodTemplateAnnotations(live, desired)
-
-			diffs := specDifferences(live.Spec, desired.Spec)
+			diffs := specDifferences(live.Spec, resources.BuildWebDeployment(instance, config).Spec)
 			AddReportEntry("h5-defaulted-fields", strings.Join(diffs, "\n"))
-			GinkgoWriter.Printf("\n── fields the builder omits that the API server defaults ──\n  %s\n",
-				strings.Join(diffs, "\n  "))
+			GinkgoWriter.Printf("\n── %d fields the builder omits that the API server defaults ──\n  %s\n",
+				len(diffs), strings.Join(diffs, "\n  "))
 
-			Expect(diffs).To(BeEmpty(),
-				"reconcileDeployment's DeepEqual gate compares a freshly-built spec against a "+
-					"defaulted one, so it opens on every pass and issues a redundant Update")
+			// Stand in for a sibling controller claiming a field the operator does
+			// not declare — this is the pod-template annotation SecretController
+			// writes to trigger rolling restarts.
+			sibling := &unstructured.Unstructured{}
+			sibling.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("Deployment"))
+			sibling.SetNamespace(ns)
+			sibling.SetName(webName)
+			Expect(unstructured.SetNestedStringMap(sibling.Object,
+				map[string]string{secretHashAnnotation: "sibling-owned"},
+				"spec", "template", "metadata", "annotations")).To(Succeed())
+			Expect(k8sClient.Patch(context.Background(), sibling, client.Apply,
+				client.FieldOwner("sibling-controller"), client.ForceOwnership)).To(Succeed())
+
+			// Drive the operator through repeated reconciles.
+			observeChurn(types.NamespacedName{Name: name, Namespace: ns}, churnOpts{
+				window: 8 * time.Second, poke: true, pokeInterval: time.Second,
+				deployments: []string{webName},
+			})
+
+			Expect(k8sClient.Get(context.Background(), webKey, live)).To(Succeed())
+			Expect(live.Spec.Template.Annotations).To(HaveKeyWithValue(secretHashAnnotation, "sibling-owned"),
+				"the operator overwrote a pod-template annotation it does not own")
 		})
 
 		It("ignores status-only writes to an owned HPA", func() {
