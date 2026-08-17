@@ -346,13 +346,14 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance,
 			return fmt.Errorf("getting worker deployment status: %w", err)
 		}
 	} else {
-		instance.Status.Worker = &v1alpha1.WorkerComponentStatus{
-			ComponentStatus: v1alpha1.ComponentStatus{
-				Replicas:      workerDeploy.Status.Replicas,
-				ReadyReplicas: workerDeploy.Status.ReadyReplicas,
-				Issues:        r.podIssuesFor(ctx, instance, componentWorker, workerDeploy),
-			},
+		// Mutate in place: CircuitBreakerActive/Reason are owned by the circuit
+		// breaker, and replacing the struct wipes them.
+		if instance.Status.Worker == nil {
+			instance.Status.Worker = &v1alpha1.WorkerComponentStatus{}
 		}
+		instance.Status.Worker.Replicas = workerDeploy.Status.Replicas
+		instance.Status.Worker.ReadyReplicas = workerDeploy.Status.ReadyReplicas
+		instance.Status.Worker.Issues = r.podIssuesFor(ctx, instance, componentWorker, workerDeploy)
 	}
 
 	instance.Status.Phase, instance.Status.Ready = derivePhase(instance)
