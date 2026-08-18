@@ -19,6 +19,9 @@ go.work
 # Kubernetes Generated files - skip generated files, except for vendored files
 !vendor/**/zz_generated.*
 
+# Build output from `make build-installer`
+dist/
+
 # Documentation site
 docs/node_modules
 docs/.vitepress/cache

@@ -964,6 +964,15 @@ type SecuritySpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	RunAsNonRoot *bool `json:"runAsNonRoot,omitempty"`
+	// RunAsUser is the numeric UID the containers run as. RunAsNonRoot on its
+	// own is not enough: the Langfuse images declare a non-numeric USER
+	// (nextjs for web, expressjs for worker), which the kubelet cannot resolve,
+	// so it refuses the container rather than assume it is non-root. 1001 is
+	// the UID in the published images; override it if you build your own with a
+	// different ARG UID.
+	// +kubebuilder:default=1001
+	// +optional
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
 	// NetworkPolicy configures NetworkPolicy creation.
 	// +optional
 	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`

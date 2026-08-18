@@ -158,6 +158,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 |---|---|---|---|
 | `readOnlyRootFilesystem` | *bool | `true` | Read-only root filesystem |
 | `runAsNonRoot` | *bool | `true` | Run containers as non-root |
+| `runAsUser` | *int64 | `1001` | Numeric UID to run as. Required alongside `runAsNonRoot`, because the Langfuse images declare a non-numeric `USER` the kubelet cannot verify. Override only if you build images with a different `ARG UID`. |
 | `networkPolicy.enabled` | *bool | `true` | Create NetworkPolicy |
 | `telemetry.enabled` | *bool | `true` | Langfuse telemetry |
 

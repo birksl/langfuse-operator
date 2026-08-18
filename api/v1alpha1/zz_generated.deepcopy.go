@@ -2088,6 +2088,11 @@ func (in *SecuritySpec) DeepCopyInto(out *SecuritySpec) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.RunAsUser != nil {
+		in, out := &in.RunAsUser, &out.RunAsUser
+		*out = new(int64)
+		**out = **in
+	}
 	if in.NetworkPolicy != nil {
 		in, out := &in.NetworkPolicy, &out.NetworkPolicy
 		*out = new(NetworkPolicySpec)
