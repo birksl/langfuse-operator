@@ -82,14 +82,14 @@ metadata:
     capabilities: Deep Insights
     categories: AI/Machine Learning, Monitoring
     containerImage: ghcr.io/palenaai/langfuse-operator:v0.10.0
-    createdAt: "2026-07-20T15:22:54Z"
+    createdAt: "2026-08-18T05:21:08Z"
     description: Kubernetes operator for deploying and managing production-ready Langfuse
       LLM observability instances.
     operators.operatorframework.io/builder: operator-sdk-v1.42.1
     operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
     repository: https://github.com/PalenaAI/langfuse-operator
     support: bitkaio LLC
-  name: langfuse-operator.v0.10.0
+  name: langfuse-operator.v0.10.1-birk01
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -339,7 +339,7 @@ spec:
                 - --health-probe-bind-address=:8081
                 command:
                 - /manager
-                image: ghcr.io/palenaai/langfuse-operator:v0.10.0
+                image: registry.xait.no/xait-platform/upstream-images/langfuse/operator:v0.10.1-birk01
                 livenessProbe:
                   httpGet:
                     path: /healthz
@@ -435,4 +435,4 @@ spec:
   provider:
     name: bitkaio LLC
     url: https://palena.ai
-  version: 0.10.0
+  version: 0.10.1-birk01
