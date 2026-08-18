@@ -26,6 +26,20 @@ leaderElection:
 # Health and readiness probe bind address
 healthProbeBindAddress: ":8081"
 
+# Operator log level: debug, info, error, or a zap verbosity integer.
+# The binary is built with zap development mode on, which would otherwise log at
+# debug — most of that volume is per-probe circuit-breaker and health-check
+# lines. Set to debug when diagnosing an instance; empty leaves the built-in
+# default alone.
+logLevel: info
+
+# Log encoding: json or console. Development mode would otherwise pick console,
+# which prefixes each line with a tab-separated timestamp and level and renders
+# only the fields as JSON — close enough to fool a log shipper expecting one
+# object per line. Set console for readable kubectl logs; empty leaves the
+# built-in default alone.
+logFormat: json
+
 resources:
   limits:
     cpu: 500m

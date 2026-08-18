@@ -42,6 +42,15 @@ spec:
             - --leader-elect
             {{- end }}
             - --health-probe-bind-address={{ .Values.healthProbeBindAddress }}
+            {{- with .Values.logLevel }}
+            - --zap-log-level={{ . }}
+            {{- end }}
+            {{- with .Values.logFormat }}
+            {{- if not (has . (list "json" "console")) }}
+            {{- fail (printf "logFormat must be json or console, got %q" .) }}
+            {{- end }}
+            - --zap-encoder={{ . }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           livenessProbe:
