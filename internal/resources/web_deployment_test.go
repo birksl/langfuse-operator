@@ -19,6 +19,7 @@ package resources
 import (
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +35,7 @@ const (
 )
 
 func ptrInt32(v int32) *int32 { return &v }
+func ptrInt64(v int64) *int64 { return &v }
 func ptrBool(v bool) *bool    { return &v }
 
 func minimalInstance() *v1alpha1.LangfuseInstance {
@@ -210,6 +212,50 @@ func TestBuildWebDeployment_SecurityContext(t *testing.T) {
 	}
 	if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
 		t.Error("runAsNonRoot should be true")
+	}
+}
+
+// runAsNonRoot without a numeric UID is rejected by the kubelet, because the
+// Langfuse images declare a non-numeric USER it cannot resolve. Both components
+// must carry runAsUser whenever the security block is set.
+func TestBuildDeployments_RunAsUserAccompaniesRunAsNonRoot(t *testing.T) {
+	for _, tc := range []struct {
+		component string
+		build     func(*v1alpha1.LangfuseInstance, *langfuse.Config) *appsv1.Deployment
+	}{
+		{"web", BuildWebDeployment},
+		{"worker", BuildWorkerDeployment},
+	} {
+		t.Run(tc.component, func(t *testing.T) {
+			instance := minimalInstance()
+			instance.Spec.Security = &v1alpha1.SecuritySpec{
+				RunAsNonRoot: ptrBool(true),
+				RunAsUser:    ptrInt64(1001),
+			}
+
+			sc := tc.build(instance, buildConfig(instance)).Spec.Template.Spec.Containers[0].SecurityContext
+			if sc == nil || sc.RunAsUser == nil {
+				t.Fatalf("runAsUser must be set alongside runAsNonRoot, got %+v", sc)
+			}
+			if *sc.RunAsUser != 1001 {
+				t.Errorf("runAsUser = %d, want 1001", *sc.RunAsUser)
+			}
+			if *sc.RunAsUser == 0 {
+				t.Error("runAsUser 0 contradicts runAsNonRoot")
+			}
+		})
+	}
+}
+
+// A custom rebuild can use a different ARG UID, so the field must be honoured
+// rather than pinned to the default.
+func TestBuildWebDeployment_RunAsUserOverride(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.Security = &v1alpha1.SecuritySpec{RunAsUser: ptrInt64(2000)}
+
+	sc := BuildWebDeployment(instance, buildConfig(instance)).Spec.Template.Spec.Containers[0].SecurityContext
+	if sc.RunAsUser == nil || *sc.RunAsUser != 2000 {
+		t.Errorf("runAsUser = %v, want 2000", sc.RunAsUser)
 	}
 }
 

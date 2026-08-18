@@ -159,6 +159,9 @@ func containerSecurityContext(instance *v1alpha1.LangfuseInstance) *corev1.Secur
 	if instance.Spec.Security.RunAsNonRoot != nil {
 		sc.RunAsNonRoot = instance.Spec.Security.RunAsNonRoot
 	}
+	if instance.Spec.Security.RunAsUser != nil {
+		sc.RunAsUser = instance.Spec.Security.RunAsUser
+	}
 	return sc
 }
 

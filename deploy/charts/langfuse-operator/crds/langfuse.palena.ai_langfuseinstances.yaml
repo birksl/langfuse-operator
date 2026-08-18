@@ -1216,6 +1216,17 @@ spec:
                     default: true
                     description: RunAsNonRoot toggles non-root execution.
                     type: boolean
+                  runAsUser:
+                    default: 1001
+                    description: |-
+                      RunAsUser is the numeric UID the containers run as. RunAsNonRoot on its
+                      own is not enough: the Langfuse images declare a non-numeric USER
+                      (nextjs for web, expressjs for worker), which the kubelet cannot resolve,
+                      so it refuses the container rather than assume it is non-root. 1001 is
+                      the UID in the published images; override it if you build your own with a
+                      different ARG UID.
+                    format: int64
+                    type: integer
                   telemetry:
                     description: Telemetry controls Langfuse's built-in telemetry.
                     properties:
