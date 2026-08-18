@@ -31,11 +31,6 @@ func BuildWebDeployment(instance *v1alpha1.LangfuseInstance, config *langfuse.Co
 	labels := CommonLabels(instance, "web")
 	selectorLabels := SelectorLabels(instance, "web")
 
-	replicas := int32(1)
-	if instance.Spec.Web.Replicas != nil {
-		replicas = *instance.Spec.Web.Replicas
-	}
-
 	envVars := mergeEnv(config.CommonEnv, config.WebEnv, instance.Spec.Web.ExtraEnv)
 
 	container := corev1.Container{
@@ -81,7 +76,7 @@ func BuildWebDeployment(instance *v1alpha1.LangfuseInstance, config *langfuse.Co
 			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
+			Replicas: ownedReplicas(instance.Spec.Web.Replicas, instance.Spec.Web.Autoscaling, false),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: selectorLabels,
 			},
@@ -95,6 +90,22 @@ func BuildWebDeployment(instance *v1alpha1.LangfuseInstance, config *langfuse.Co
 	}
 
 	return deployment
+}
+
+// ownedReplicas returns the replica count the operator should declare, or nil
+// when another controller owns it: an HPA once autoscaling is enabled, or the
+// circuit breaker while it holds the worker at zero. Callers that write the
+// Deployment must carry the live value forward for nil, or the API server
+// defaults it back to 1 and undoes the other controller's decision.
+func ownedReplicas(configured *int32, autoscaling *v1alpha1.AutoscalingSpec, relinquish bool) *int32 {
+	if relinquish || (autoscaling != nil && autoscaling.Enabled) {
+		return nil
+	}
+	replicas := int32(1)
+	if configured != nil {
+		replicas = *configured
+	}
+	return &replicas
 }
 
 func containerImage(instance *v1alpha1.LangfuseInstance) string {

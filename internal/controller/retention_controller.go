@@ -28,8 +28,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 )
@@ -75,6 +77,8 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. If ClickHouse retention is not configured, skip
 	if instance.Spec.ClickHouse == nil || instance.Spec.ClickHouse.Retention == nil {
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
@@ -84,7 +88,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 			Message:            "No ClickHouse retention policy configured",
 			ObservedGeneration: instance.Generation,
 		})
-		if err := r.Status().Update(ctx, instance); err != nil {
+		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating retention status: %w", err)
 		}
 		return ctrl.Result{RequeueAfter: retentionRequeueInterval}, nil
@@ -140,7 +144,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.evaluateStoragePressure(ctx, instance, retention.StoragePressure)
 	}
 
-	if err := r.Status().Update(ctx, instance); err != nil {
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating retention status: %w", err)
 	}
 
@@ -318,8 +322,10 @@ func humanizeBytes(b uint64) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RetentionController) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Its own RequeueAfter picks up anything it still needs to observe.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("retention").
 		Complete(r)
 }

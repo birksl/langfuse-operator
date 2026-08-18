@@ -28,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 	"github.com/PalenaAI/langfuse-operator/internal/langfuse"
@@ -63,6 +65,8 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	if !instance.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+
+	original := instance.DeepCopy()
 
 	// Skip if migration is disabled
 	if instance.Spec.Database != nil && instance.Spec.Database.Migration != nil &&
@@ -97,16 +101,14 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, fmt.Errorf("setting owner reference on migration job: %w", err)
 		}
 
-		// Set instance phase to Migrating
-		instance.Status.Phase = phaseMigrating
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               "MigrationsComplete",
+			Type:               conditionMigrationsComplete,
 			Status:             metav1.ConditionFalse,
-			Reason:             "MigrationStarted",
+			Reason:             reasonMigrationStarted,
 			Message:            fmt.Sprintf("Running migrations for version %s", desiredTag),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 
@@ -126,9 +128,9 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	if existingJob.Status.Succeeded > 0 {
 		log.Info("migration job succeeded", "version", desiredTag)
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               "MigrationsComplete",
+			Type:               conditionMigrationsComplete,
 			Status:             metav1.ConditionTrue,
-			Reason:             "MigrationSucceeded",
+			Reason:             reasonMigrationSucceeded,
 			Message:            fmt.Sprintf("Migrations completed for version %s", desiredTag),
 			ObservedGeneration: instance.Generation,
 		})
@@ -136,7 +138,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			instance.Status.Database = &v1alpha1.DatabaseStatus{}
 		}
 		instance.Status.Database.MigrationVersion = langfuse.NormalizeVersion(desiredTag)
-		if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 		r.Recorder.Eventf(instance, "Normal", "MigrationCompleted",
@@ -162,16 +164,15 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		if existingJob.Status.Failed >= backoffLimit {
 			log.Error(nil, "migration job failed", "version", desiredTag, "failures", existingJob.Status.Failed)
 			summary := fmt.Sprintf("Migration job failed after %d attempts", existingJob.Status.Failed)
-			reason, message := summarizePodIssues(issues, "MigrationFailed", summary)
+			_, message := summarizePodIssues(issues, reasonMigrationFailed, summary)
 			meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-				Type:               "MigrationsComplete",
+				Type:               conditionMigrationsComplete,
 				Status:             metav1.ConditionFalse,
-				Reason:             reason,
+				Reason:             reasonMigrationFailed,
 				Message:            message,
 				ObservedGeneration: instance.Generation,
 			})
-			instance.Status.Phase = phaseError
-			if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+			if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 				log.Error(statusErr, "failed to update status")
 			}
 			r.Recorder.Eventf(instance, "Warning", "MigrationFailed",
@@ -185,19 +186,16 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	log.Info("migration job in progress", "version", desiredTag)
 	if len(issues) > 0 {
 		summary := "Migration job in progress"
-		reason, message := summarizePodIssues(issues, "MigrationInProgress", summary)
+		_, message := summarizePodIssues(issues, reasonMigrationInProgress, summary)
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               "MigrationsComplete",
+			Type:               conditionMigrationsComplete,
 			Status:             metav1.ConditionFalse,
-			Reason:             reason,
+			Reason:             reasonMigrationInProgress,
 			Message:            message,
 			ObservedGeneration: instance.Generation,
 		})
-		if hasFatalIssue(issues) {
-			instance.Status.Phase = phaseError
-		}
 	}
-	if statusErr := r.Status().Update(ctx, instance); statusErr != nil {
+	if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 		log.Error(statusErr, "failed to update status")
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -244,8 +242,10 @@ func (r *MigrationController) cleanupCompletedJobs(ctx context.Context, instance
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *MigrationController) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Its own RequeueAfter picks up anything it still needs to observe.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&batchv1.Job{}).
 		Named("migration").
 		Complete(r)

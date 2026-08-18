@@ -28,8 +28,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 	"github.com/PalenaAI/langfuse-operator/internal/resources"
@@ -79,13 +81,15 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	original := instance.DeepCopy()
+
 	// 2. Skip dependency probes while a migration is running — the stores are
 	// intentionally in flux and the migration controller owns the phase.
 	// Pending is deliberately NOT skipped: a first rollout that never comes up
 	// (bad image, missing Secret key) sits in Pending forever, and that is
 	// exactly when the user needs the pod-level diagnosis below.
-	if instance.Status.Phase == phaseMigrating {
-		log.V(1).Info("skipping health check during migration", "phase", instance.Status.Phase)
+	if migrationRunning(instance) {
+		log.V(1).Info("skipping health check during migration")
 		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
 	}
 
@@ -115,18 +119,9 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	workerCondition := r.checkWorkerDeployment(ctx, instance)
 	r.applyCondition(instance, workerCondition)
 
-	// 9. Determine overall health.
-	r.determineOverallHealth(instance, []metav1.Condition{
-		dbCondition,
-		chCondition,
-		redisCondition,
-		blobCondition,
-		webCondition,
-		workerCondition,
-	})
-
-	// 10. Update status.
-	if err := r.Status().Update(ctx, instance); err != nil {
+	// 9. Update status. Phase and readiness are owned by the instance
+	// controller, which derives them from the conditions set above.
+	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating health status: %w", err)
 	}
 
@@ -299,35 +294,6 @@ func (r *HealthMonitorReconciler) applyCondition(instance *v1alpha1.LangfuseInst
 	meta.SetStatusCondition(&instance.Status.Conditions, condition)
 }
 
-// determineOverallHealth sets the instance phase based on component conditions.
-// Critical components are Database, ClickHouse, Redis, Web, and Worker.
-// BlobStorage is only critical if explicitly configured.
-//
-// A fatal pod issue (bad image reference, missing Secret key) reports Error
-// rather than Degraded: Degraded implies the instance may recover on its own,
-// whereas these need the user to change something.
-func (r *HealthMonitorReconciler) determineOverallHealth(instance *v1alpha1.LangfuseInstance, conditions []metav1.Condition) {
-	allReady := true
-	for _, c := range conditions {
-		if c.Status != metav1.ConditionTrue {
-			allReady = false
-			break
-		}
-	}
-
-	switch {
-	case allReady:
-		instance.Status.Phase = phaseRunning
-		instance.Status.Ready = true
-	case instanceHasFatalPodIssue(instance):
-		instance.Status.Phase = phaseError
-		instance.Status.Ready = false
-	default:
-		instance.Status.Phase = phaseDegraded
-		instance.Status.Ready = false
-	}
-}
-
 // instanceHasFatalPodIssue reports whether any component has a pod issue that
 // requires human intervention.
 func instanceHasFatalPodIssue(instance *v1alpha1.LangfuseInstance) bool {
@@ -335,6 +301,9 @@ func instanceHasFatalPodIssue(instance *v1alpha1.LangfuseInstance) bool {
 		return true
 	}
 	if instance.Status.Worker != nil && hasFatalIssue(instance.Status.Worker.Issues) {
+		return true
+	}
+	if instance.Status.Migration != nil && hasFatalIssue(instance.Status.Migration.Issues) {
 		return true
 	}
 	return false
@@ -348,8 +317,10 @@ func conditionChanged(existing, updated metav1.Condition) bool {
 
 // SetupWithManager sets up the health monitor controller with the Manager.
 func (r *HealthMonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Only spec changes need to reach this controller; sibling status writes do
+	// not. Its own RequeueAfter picks up anything it still needs to observe.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.LangfuseInstance{}).
+		For(&v1alpha1.LangfuseInstance{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("healthmonitor").
 		Complete(r)
 }
