@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -74,12 +75,36 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	// Check if version changed
+	// Gate on the version this controller last migrated, not Status.Version.
+	// Status.Version is written by the instance controller on every pass and
+	// means "deployed", so whichever controller won the race on a fresh CR
+	// decided whether migrations ever ran — and once set it never reopened.
 	desiredTag := instance.Spec.Image.Tag
-	currentVersion := instance.Status.Version
+	currentVersion := ""
+	if instance.Status.Database != nil {
+		currentVersion = instance.Status.Database.MigrationVersion
+	}
 	if !langfuse.VersionChanged(desiredTag, currentVersion) && currentVersion != "" {
 		// Version hasn't changed, check if existing migration job needs cleanup
 		return r.cleanupCompletedJobs(ctx, instance)
+	}
+
+	// The Job's migration step exits non-zero without these, so refuse to
+	// create a Job that cannot succeed and say which keys are missing.
+	if missing := missingClickHouseMigrationKeys(instance); len(missing) > 0 {
+		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:   conditionMigrationsComplete,
+			Status: metav1.ConditionFalse,
+			Reason: reasonMigrationFailed,
+			Message: fmt.Sprintf("spec.clickhouse.external.secretRef.keys is missing %s, "+
+				"which the ClickHouse migration step requires", strings.Join(missing, ", ")),
+			ObservedGeneration: instance.Generation,
+		})
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
+			log.Error(statusErr, "failed to update status")
+		}
+		log.Error(nil, "refusing to create migration job", "missingKeys", missing)
+		return ctrl.Result{}, nil
 	}
 
 	// Build config for migration job env vars
@@ -238,6 +263,26 @@ func (r *MigrationController) cleanupCompletedJobs(ctx context.Context, instance
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// missingClickHouseMigrationKeys lists the logical secret keys that external
+// ClickHouse needs for migrations but the spec does not map. The migration
+// step (packages/shared/clickhouse/scripts/up.sh in the Langfuse image) exits 1
+// when CLICKHOUSE_MIGRATION_URL, CLICKHOUSE_USER or CLICKHOUSE_PASSWORD is
+// unset, and the operator only emits those env vars for keys that are present.
+// Managed mode is exempt: it derives all three itself.
+func missingClickHouseMigrationKeys(instance *v1alpha1.LangfuseInstance) []string {
+	if instance.Spec.ClickHouse == nil || instance.Spec.ClickHouse.External == nil {
+		return nil
+	}
+	keys := instance.Spec.ClickHouse.External.SecretRef.Keys
+	var missing []string
+	for _, required := range []string{"migrationUrl", "username", "password"} {
+		if keys[required] == "" {
+			missing = append(missing, required)
+		}
+	}
+	return missing
 }
 
 // SetupWithManager sets up the controller with the Manager.
