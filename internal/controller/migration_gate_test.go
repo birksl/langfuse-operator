@@ -71,6 +71,9 @@ func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
 // The gate must reopen when the migration target changes, not only the tag —
 // otherwise repointing at a different (empty) ClickHouse database gives the
 // workload a new CLICKHOUSE_DB against a schema that was never created.
+//
+// Reopening is only the first stage: retargetedComponents then refuses a target
+// change on an already-migrated instance. This test covers the gate alone.
 func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
 	withStatus := func(tag, appliedIdentity, legacyVersion, database string) *v1alpha1.LangfuseInstance {
 		instance := &v1alpha1.LangfuseInstance{
@@ -202,6 +205,87 @@ func TestIdentityClusterMode(t *testing.T) {
 	// controller must treat that as "unknown" rather than "false".
 	if _, ok := identityClusterMode("3.126.0|clickhouse-db=langfuse"); ok {
 		t.Error("a pre-clustering identity should report no recorded mode")
+	}
+}
+
+// The ClickHouse target is fixed once a schema exists: another database would
+// leave the existing rows behind, and a table's engine cannot change after
+// CREATE. Only the version may move in place — that is the upgrade path.
+func TestRetargetedComponents(t *testing.T) {
+	cases := []struct {
+		name             string
+		applied, desired string
+		wantChanged      int
+	}{
+		{
+			name:        "plain version upgrade is allowed",
+			applied:     buildMigrationIdentity("3.100.0", "langfuse", true),
+			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+		{
+			name:        "never migrated — anything goes",
+			applied:     "",
+			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+		{
+			name:        "database retargeted",
+			applied:     buildMigrationIdentity("3.126.0", "old", false),
+			desired:     buildMigrationIdentity("3.126.0", "new", false),
+			wantChanged: 1,
+		},
+		{
+			name:        "clustering flipped",
+			applied:     buildMigrationIdentity("3.126.0", "langfuse", false),
+			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			wantChanged: 1,
+		},
+		{
+			// Previously allowed as an escape hatch. Both changing at once is
+			// still a retarget, and belongs on a separate instance.
+			name:        "both at once",
+			applied:     buildMigrationIdentity("3.126.0", "langfuse", false),
+			desired:     buildMigrationIdentity("3.126.0", "langfuse_clustered", true),
+			wantChanged: 2,
+		},
+		{
+			// Recorded before clustering was tracked: nothing to compare it to,
+			// so only the database is checked.
+			name:        "identity predating clustering",
+			applied:     "3.126.0|clickhouse-db=langfuse",
+			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := retargetedComponents(tc.applied, tc.desired)
+			if len(changed) != tc.wantChanged {
+				t.Errorf("changed = %v (%d), want %d", changed, len(changed), tc.wantChanged)
+			}
+		})
+	}
+}
+
+// The database is the last component so a name containing the separator still
+// round-trips, and the marker prefixes must not be confused with each other.
+func TestIdentityDatabase(t *testing.T) {
+	for _, database := range []string{"default", "langfuse", "db-clickhouse-cluster=x", "odd|name", "with=equals"} {
+		identity := buildMigrationIdentity("3.126.0", database, true)
+
+		got, ok := identityDatabase(identity)
+		if !ok || got != database {
+			t.Errorf("identityDatabase(%q) = %q (found=%v), want %q", identity, got, ok, database)
+		}
+		if mode, ok := identityClusterMode(identity); !ok || mode != "true" {
+			t.Errorf("cluster mode for database %q = %q (found=%v), want true", database, mode, ok)
+		}
+	}
+
+	if _, ok := identityDatabase("3.126.0|clickhouse-cluster=true"); ok {
+		t.Error("an identity with no database component should report none")
 	}
 }
 

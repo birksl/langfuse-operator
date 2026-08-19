@@ -90,32 +90,28 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.cleanupCompletedJobs(ctx, instance)
 	}
 
-	// Clustering picks the table engine at CREATE time — ReplicatedReplacingMergeTree
-	// with ON CLUSTER DDL, or plain ReplacingMergeTree — so it cannot be
-	// re-migrated into. The clustered DDL would fail against tables that already
-	// exist, and converting them means INSERT SELECT into new tables by hand.
-	// Refuse rather than start a Job that cannot succeed.
-	if applied := appliedMigrationIdentity(instance); applied != "" {
-		was, recorded := identityClusterMode(applied)
-		want, _ := identityClusterMode(desiredIdentity)
-		if recorded && was != want {
-			meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-				Type:   conditionMigrationsComplete,
-				Status: metav1.ConditionFalse,
-				Reason: reasonMigrationFailed,
-				Message: fmt.Sprintf("spec.clickhouse.cluster.enabled changed to %s after migrations "+
-					"ran with %s. ClickHouse table engines are fixed at CREATE time, so this needs the "+
-					"tables rebuilt by hand; revert the field, or migrate the data into a new database "+
-					"and set spec.clickhouse.database to it", want, was),
-				ObservedGeneration: instance.Generation,
-			})
-			if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-				log.Error(statusErr, "failed to update status")
-			}
-			log.Error(nil, "refusing to re-migrate across a clustering change",
-				"applied", was, "desired", want)
-			return ctrl.Result{}, nil
+	// The datastore target is fixed once a schema exists. Re-pointing at another
+	// database would leave every row already written behind, invisible to the
+	// application; clustering fixes the table engine at CREATE time and cannot be
+	// converted in place. Neither is something to do by editing a live CR, so
+	// refuse and say what to do instead.
+	if changed := retargetedComponents(appliedMigrationIdentity(instance), desiredIdentity); len(changed) > 0 {
+		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:   conditionMigrationsComplete,
+			Status: metav1.ConditionFalse,
+			Reason: reasonMigrationFailed,
+			Message: fmt.Sprintf("%s changed after migrations already ran. The ClickHouse target is "+
+				"fixed once its schema exists: another database would leave the existing data behind, "+
+				"and a table's engine cannot be changed after CREATE. Revert the change, or create a "+
+				"separate LangfuseInstance for the new target and cut over once it has migrated",
+				strings.Join(changed, " and ")),
+			ObservedGeneration: instance.Generation,
+		})
+		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
+			log.Error(statusErr, "failed to update status")
 		}
+		log.Error(nil, "refusing to retarget a migrated instance", "changed", changed)
+		return ctrl.Result{}, nil
 	}
 
 	// The Job's migration step exits non-zero without these, so refuse to
@@ -345,14 +341,22 @@ func migrationIdentity(instance *v1alpha1.LangfuseInstance) string {
 }
 
 func buildMigrationIdentity(version, database string, clustered bool) string {
-	return fmt.Sprintf("%s|clickhouse-db=%s|%s%t",
-		langfuse.NormalizeVersion(version), database, migrationIdentityClusterKey, clustered)
+	return fmt.Sprintf("%s|%s%t|%s%s",
+		langfuse.NormalizeVersion(version),
+		migrationIdentityClusterKey, clustered,
+		migrationIdentityDatabaseKey, database)
 }
 
-// migrationIdentityClusterKey prefixes the clustering component of an identity.
-// Clustering is the one component that cannot be re-migrated into, so it has to
-// be recoverable from a recorded identity.
-const migrationIdentityClusterKey = "clickhouse-cluster="
+const (
+	// migrationIdentityClusterKey prefixes the clustering component. Clustering
+	// cannot be re-migrated into, so it has to be recoverable from a recorded
+	// identity.
+	migrationIdentityClusterKey = "clickhouse-cluster="
+	// migrationIdentityDatabaseKey prefixes the database component, which
+	// decides whether a clustering change has somewhere empty to land. It comes
+	// last so a database name containing the separator still round-trips.
+	migrationIdentityDatabaseKey = "clickhouse-db="
+)
 
 // identityClusterMode extracts the clustering component of a recorded identity.
 func identityClusterMode(identity string) (string, bool) {
@@ -360,6 +364,44 @@ func identityClusterMode(identity string) (string, bool) {
 		if mode, ok := strings.CutPrefix(part, migrationIdentityClusterKey); ok {
 			return mode, true
 		}
+	}
+	return "", false
+}
+
+// retargetedComponents lists which parts of the datastore target differ from
+// what the last successful migration used. Both are fixed when the schema is
+// created: pointing at another database orphans every row already written, and
+// ClickHouse fixes a table's engine at CREATE time, so clustering cannot be
+// converted in place either.
+//
+// The version is deliberately excluded — upgrading in place is the normal path,
+// and that is what re-running migrations is for.
+func retargetedComponents(applied, desired string) []string {
+	if applied == "" {
+		return nil // never migrated; anything goes
+	}
+
+	var changed []string
+	if was, ok := identityDatabase(applied); ok {
+		if want, _ := identityDatabase(desired); was != want {
+			changed = append(changed, fmt.Sprintf("spec.clickhouse.database %q -> %q", was, want))
+		}
+	}
+	// Absent on identities recorded before clustering was tracked, in which case
+	// there is nothing to compare against.
+	if was, ok := identityClusterMode(applied); ok {
+		if want, _ := identityClusterMode(desired); was != want {
+			changed = append(changed, fmt.Sprintf("spec.clickhouse.cluster.enabled %s -> %s", was, want))
+		}
+	}
+	return changed
+}
+
+// identityDatabase extracts the database component of a recorded identity. It is
+// the final component, so everything after the marker is the name.
+func identityDatabase(identity string) (string, bool) {
+	if i := strings.Index(identity, "|"+migrationIdentityDatabaseKey); i >= 0 {
+		return identity[i+len("|"+migrationIdentityDatabaseKey):], true
 	}
 	return "", false
 }

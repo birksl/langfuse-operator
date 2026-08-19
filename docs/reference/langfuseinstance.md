@@ -135,7 +135,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `encryption` | *ClickHouseEncryptionSpec | Encryption settings |
 | `retention` | *RetentionSpec | Data retention policies |
 | `schemaDrift` | *SchemaDriftSpec | Schema drift detection |
-| `database` | string | ClickHouse database (`CLICKHOUSE_DB`), also used by schema-drift detection and retention. Defaults to `default`. **The database must already exist** — no Langfuse migration creates it, and neither does the operator. Never put it in the connection URL. |
+| `database` | string | ClickHouse database (`CLICKHOUSE_DB`), also used by schema-drift detection and retention. Defaults to `default`. **The database must already exist** — no Langfuse migration creates it, and neither does the operator. Never put it in the connection URL. Fixed once migrations have succeeded; see the note under ClickHouseClusterSpec. |
 | `cluster` | *ClickHouseClusterSpec | Replicated (clustered) ClickHouse — see below |
 
 ### ClickHouseClusterSpec
@@ -149,7 +149,9 @@ Only for `external` ClickHouse that is a genuine replicated cluster with Keeper 
 Two constraints worth knowing before you enable it:
 
 - **Your cluster must be named `default`.** Langfuse's clustered migrations hardcode `ON CLUSTER default` and golang-migrate does not template SQL, so any other cluster name requires hand-written migrations. The operator deliberately exposes no cluster-name field rather than one that only half works.
-- **It cannot be changed after migrations have run.** ClickHouse fixes a table's engine at `CREATE` time, so switching would need every table rebuilt via `INSERT SELECT`. The operator refuses the change and reports it on `MigrationsComplete` instead of starting a migration that would fail. To move an existing instance, migrate the data into a new database by hand and point `clickhouse.database` at it.
+- **It cannot be changed after migrations have run.** ClickHouse fixes a table's engine at `CREATE` time, so switching would need every table rebuilt via `INSERT SELECT`. The operator refuses the change and reports it on `MigrationsComplete` rather than starting a migration that would fail against the existing tables.
+
+Both `cluster.enabled` and `database` are part of the instance's ClickHouse target, and the operator treats that target as fixed once a schema exists — only the image tag moves in place, which is the upgrade path. To change either, create a **separate `LangfuseInstance`** for the new target and cut over once it has migrated. The old instance keeps serving the old data until you remove it, which an in-place edit would not: re-pointing at another database leaves every row already written behind, invisible to the application, with nothing to warn you.
 
 ### RedisSpec
 

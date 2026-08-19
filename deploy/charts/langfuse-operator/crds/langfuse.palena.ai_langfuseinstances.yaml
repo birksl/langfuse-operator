@@ -476,9 +476,10 @@ spec:
                           exposes no cluster-name field rather than one that only half works.
 
                           This picks the table engine at CREATE time, so it cannot be changed once
-                          migrations have run — the clustered DDL would fail against existing
-                          tables, and converting them needs an INSERT SELECT by hand. The operator
-                          refuses the change rather than starting a migration that cannot succeed.
+                          migrations have run: the existing tables already have the other engine and
+                          converting them needs an INSERT SELECT by hand. The operator refuses the
+                          change rather than starting a migration that cannot succeed. Create a
+                          separate LangfuseInstance for the new target and cut over instead.
                         type: boolean
                     type: object
                   database:
@@ -494,6 +495,12 @@ spec:
                       Defaults to "default" when unset. The operator emits CLICKHOUSE_DB only
                       when this is set, so leaving it empty keeps existing pod templates
                       byte-identical and avoids a rollout on upgrade.
+
+                      Freely editable until migrations first succeed, and fixed after that:
+                      re-pointing a live instance would leave every row already written behind,
+                      invisible to the application, which is not something an in-place edit
+                      should do silently. Create a separate LangfuseInstance for the new database
+                      and cut over instead.
                     type: string
                   encryption:
                     description: Encryption configures ClickHouse encryption settings.
