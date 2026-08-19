@@ -75,17 +75,18 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	// Gate on the version this controller last migrated, not Status.Version.
+	// Gate on what the last migration ran against, not Status.Version.
 	// Status.Version is written by the instance controller on every pass and
 	// means "deployed", so whichever controller won the race on a fresh CR
 	// decided whether migrations ever ran — and once set it never reopened.
+	//
+	// The identity covers the ClickHouse database as well as the tag: pointing
+	// an unchanged image at a different database gives the workload a new
+	// CLICKHOUSE_DB, and that database needs its tables.
 	desiredTag := instance.Spec.Image.Tag
-	currentVersion := ""
-	if instance.Status.Database != nil {
-		currentVersion = instance.Status.Database.MigrationVersion
-	}
-	if !langfuse.VersionChanged(desiredTag, currentVersion) && currentVersion != "" {
-		// Version hasn't changed, check if existing migration job needs cleanup
+	desiredIdentity := migrationIdentity(instance)
+	if applied := appliedMigrationIdentity(instance); applied == desiredIdentity {
+		// Nothing to migrate, check if an existing Job needs cleanup
 		return r.cleanupCompletedJobs(ctx, instance)
 	}
 
@@ -120,8 +121,12 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	if apierrors.IsNotFound(err) {
 		// Create migration job
-		log.Info("creating migration job", "version", desiredTag)
+		log.Info("creating migration job", "version", desiredTag, "identity", desiredIdentity)
 		job := resources.BuildMigrationJob(instance, config)
+		if job.Annotations == nil {
+			job.Annotations = map[string]string{}
+		}
+		job.Annotations[migrationIdentityAnnotation] = desiredIdentity
 		if err := controllerutil.SetControllerReference(instance, job, r.Scheme); err != nil {
 			return ctrl.Result{}, fmt.Errorf("setting owner reference on migration job: %w", err)
 		}
@@ -149,6 +154,26 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("getting migration job: %w", err)
 	}
 
+	// The Job name carries no version, and a succeeded Job lingers for its
+	// TTLSecondsAfterFinished (1h). Without this check, upgrading inside that
+	// window would read the previous version's success as this version's and
+	// record it as migrated without running anything — starting the new
+	// application against the old schema. A Job spec is immutable, so a
+	// mismatch has to be replaced rather than updated. Re-running migrations is
+	// idempotent (prisma migrate deploy and golang-migrate both track what they
+	// have applied), so replacing an unrecognised Job is safe.
+	if jobIdentity := existingJob.Annotations[migrationIdentityAnnotation]; jobIdentity != desiredIdentity {
+		log.Info("replacing migration job from a different target",
+			"jobIdentity", jobIdentity, "desiredIdentity", desiredIdentity)
+		propagation := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, existingJob, &client.DeleteOptions{
+			PropagationPolicy: &propagation,
+		}); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("deleting stale migration job: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	// Job exists — check status
 	if existingJob.Status.Succeeded > 0 {
 		log.Info("migration job succeeded", "version", desiredTag)
@@ -163,6 +188,10 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			instance.Status.Database = &v1alpha1.DatabaseStatus{}
 		}
 		instance.Status.Database.MigrationVersion = langfuse.NormalizeVersion(desiredTag)
+		if instance.Status.Migration == nil {
+			instance.Status.Migration = &v1alpha1.MigrationStatus{}
+		}
+		instance.Status.Migration.AppliedIdentity = desiredIdentity
 		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
@@ -174,12 +203,15 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Diagnose the migration pods so a stuck or failed migration explains
 	// itself (bad DATABASE_URL, unreachable store, missing Secret key) instead
 	// of only reporting an attempt count.
+	// Mutate in place: replacing the struct would drop AppliedIdentity, which is
+	// what the gate reads.
 	issues := r.migrationPodIssues(ctx, instance)
-	instance.Status.Migration = &v1alpha1.MigrationStatus{
-		JobName: jobName,
-		Failed:  existingJob.Status.Failed,
-		Issues:  issues,
+	if instance.Status.Migration == nil {
+		instance.Status.Migration = &v1alpha1.MigrationStatus{}
 	}
+	instance.Status.Migration.JobName = jobName
+	instance.Status.Migration.Failed = existingJob.Status.Failed
+	instance.Status.Migration.Issues = issues
 
 	if existingJob.Status.Failed > 0 {
 		backoffLimit := int32(3)
@@ -263,6 +295,42 @@ func (r *MigrationController) cleanupCompletedJobs(ctx context.Context, instance
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// migrationIdentityAnnotation stamps a migration Job with what it was created
+// to migrate, so its success is only ever credited to that target.
+const migrationIdentityAnnotation = "langfuse.palena.ai/migration-identity"
+
+// migrationIdentity describes everything spec-visible that determines what a
+// migration produces: the Langfuse version and the ClickHouse database it
+// creates tables in.
+//
+// The Postgres and ClickHouse endpoints are deliberately absent. They come from
+// Secrets the operator would have to read on every pass, and a rotated
+// credential would look like a new target. Repointing an instance at a fresh
+// cluster by editing its Secret therefore does not re-trigger migrations — set
+// spec.clickhouse.database, or clear status.migration.appliedIdentity, to force
+// them.
+func migrationIdentity(instance *v1alpha1.LangfuseInstance) string {
+	return buildMigrationIdentity(instance.Spec.Image.Tag, clickHouseDatabase(instance))
+}
+
+func buildMigrationIdentity(version, database string) string {
+	return fmt.Sprintf("%s|clickhouse-db=%s", langfuse.NormalizeVersion(version), database)
+}
+
+// appliedMigrationIdentity returns the identity of the last successful
+// migration. Instances migrated before the field existed report only a version,
+// and necessarily ran against the "default" database — back-filling that keeps
+// an operator upgrade from re-running migrations on every existing instance.
+func appliedMigrationIdentity(instance *v1alpha1.LangfuseInstance) string {
+	if instance.Status.Migration != nil && instance.Status.Migration.AppliedIdentity != "" {
+		return instance.Status.Migration.AppliedIdentity
+	}
+	if instance.Status.Database != nil && instance.Status.Database.MigrationVersion != "" {
+		return buildMigrationIdentity(instance.Status.Database.MigrationVersion, defaultClickHouseDatabase)
+	}
+	return ""
 }
 
 // missingClickHouseMigrationKeys lists the logical secret keys that external

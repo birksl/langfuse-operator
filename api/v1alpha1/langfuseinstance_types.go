@@ -1342,6 +1342,13 @@ type MigrationStatus struct {
 	// Issues lists pod-level problems from the migration Job's pods.
 	// +optional
 	Issues []PodIssue `json:"issues,omitempty"`
+	// AppliedIdentity records what the last successful migration actually ran
+	// against — the image tag together with the ClickHouse database. Migrations
+	// re-run whenever it changes, so retargeting an empty database does not
+	// leave it without tables. The same value is stamped on the migration Job,
+	// so a Job left over from another version is never mistaken for this one's.
+	// +optional
+	AppliedIdentity string `json:"appliedIdentity,omitempty"`
 }
 
 // WorkerComponentStatus extends ComponentStatus with worker-specific fields.

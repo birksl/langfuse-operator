@@ -7555,6 +7555,14 @@ spec:
                   Migration reports the state of the database migration Job, including any
                   pod-level failures that explain a stuck or failed migration.
                 properties:
+                  appliedIdentity:
+                    description: |-
+                      AppliedIdentity records what the last successful migration actually ran
+                      against — the image tag together with the ClickHouse database. Migrations
+                      re-run whenever it changes, so retargeting an empty database does not
+                      leave it without tables. The same value is stamped on the migration Job,
+                      so a Job left over from another version is never mistaken for this one's.
+                    type: string
                   failed:
                     description: Failed is the number of failed migration pod attempts.
                     format: int32

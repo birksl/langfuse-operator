@@ -68,6 +68,111 @@ func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
 	}
 }
 
+// The gate must reopen when the migration target changes, not only the tag —
+// otherwise repointing at a different (empty) ClickHouse database gives the
+// workload a new CLICKHOUSE_DB against a schema that was never created.
+func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
+	withStatus := func(tag, appliedIdentity, legacyVersion, database string) *v1alpha1.LangfuseInstance {
+		instance := &v1alpha1.LangfuseInstance{
+			Spec: v1alpha1.LangfuseInstanceSpec{
+				Image:      v1alpha1.ImageSpec{Tag: tag},
+				ClickHouse: &v1alpha1.ClickHouseSpec{Database: database},
+			},
+		}
+		if appliedIdentity != "" {
+			instance.Status.Migration = &v1alpha1.MigrationStatus{AppliedIdentity: appliedIdentity}
+		}
+		if legacyVersion != "" {
+			instance.Status.Database = &v1alpha1.DatabaseStatus{MigrationVersion: legacyVersion}
+		}
+		return instance
+	}
+
+	cases := []struct {
+		name              string
+		instance          *v1alpha1.LangfuseInstance
+		wantShouldMigrate bool
+	}{
+		{
+			name:              "same tag and database — nothing to do",
+			instance:          withStatus("3.126.0", "3.126.0|clickhouse-db=langfuse", "", "langfuse"),
+			wantShouldMigrate: false,
+		},
+		{
+			name:              "database retargeted on an unchanged tag",
+			instance:          withStatus("3.126.0", "3.126.0|clickhouse-db=old", "", "new"),
+			wantShouldMigrate: true,
+		},
+		{
+			name:              "tag upgraded on an unchanged database",
+			instance:          withStatus("3.126.0", "3.100.0|clickhouse-db=langfuse", "", "langfuse"),
+			wantShouldMigrate: true,
+		},
+		{
+			// Migrated by an operator predating appliedIdentity: it necessarily
+			// ran against "default", so back-filling avoids a spurious re-run.
+			name:              "legacy status, still on default",
+			instance:          withStatus("3.126.0", "", "3.126.0", ""),
+			wantShouldMigrate: false,
+		},
+		{
+			name:              "legacy status, now retargeted off default",
+			instance:          withStatus("3.126.0", "", "3.126.0", "langfuse"),
+			wantShouldMigrate: true,
+		},
+		{
+			name:              "never migrated",
+			instance:          withStatus("3.126.0", "", "", "langfuse"),
+			wantShouldMigrate: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shouldMigrate := appliedMigrationIdentity(tc.instance) != migrationIdentity(tc.instance)
+			if shouldMigrate != tc.wantShouldMigrate {
+				t.Errorf("shouldMigrate = %v, want %v (applied=%q desired=%q)",
+					shouldMigrate, tc.wantShouldMigrate,
+					appliedMigrationIdentity(tc.instance), migrationIdentity(tc.instance))
+			}
+		})
+	}
+}
+
+// A succeeded Job outlives its migration by TTLSecondsAfterFinished (1h), and
+// its name carries no version — so an upgrade inside that window must not read
+// the old Job's success as its own.
+func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
+	instance := &v1alpha1.LangfuseInstance{
+		Spec: v1alpha1.LangfuseInstanceSpec{
+			Image:      v1alpha1.ImageSpec{Tag: "3.126.0"},
+			ClickHouse: &v1alpha1.ClickHouseSpec{Database: "langfuse"},
+		},
+	}
+	desired := migrationIdentity(instance)
+
+	previousVersion := buildMigrationIdentity("3.100.0", "langfuse")
+	if previousVersion == desired {
+		t.Error("a Job from the previous version must not match the desired identity")
+	}
+
+	otherDatabase := buildMigrationIdentity("3.126.0", "other")
+	if otherDatabase == desired {
+		t.Error("a Job for another database must not match the desired identity")
+	}
+
+	// A Job predating the annotation has no identity at all, so it is replaced
+	// rather than trusted.
+	if desired == "" {
+		t.Error("desired identity must never be empty, or an unannotated Job would match it")
+	}
+
+	// The v-prefix is normalised away, so v3.126.0 and 3.126.0 are one target.
+	if got := buildMigrationIdentity("v3.126.0", "langfuse"); got != desired {
+		t.Errorf("normalised identity = %q, want %q", got, desired)
+	}
+}
+
 // The operator's own ClickHouse queries must target whatever database the
 // workload uses, or schema-drift detection reports phantom drift by looking in
 // the wrong place.
