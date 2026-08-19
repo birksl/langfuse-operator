@@ -135,6 +135,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `encryption` | *ClickHouseEncryptionSpec | Encryption settings |
 | `retention` | *RetentionSpec | Data retention policies |
 | `schemaDrift` | *SchemaDriftSpec | Schema drift detection |
+| `database` | string | ClickHouse database (`CLICKHOUSE_DB`), also used by schema-drift detection and retention. Defaults to `default`. **The database must already exist** — no Langfuse migration creates it, and neither does the operator. Never put it in the connection URL. |
 
 ### RedisSpec
 
@@ -340,7 +341,7 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 
 | Field | Type | Description |
 |---|---|---|
-| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (HTTP, e.g. `http://ch:8123`), `migrationUrl` (native, e.g. `clickhouse://ch:9000`), `username`, `password`. With a `tls` block, use the TLS scheme/port (`https://…:8443`, `clickhouse://…:9440`). |
+| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (HTTP, e.g. `http://ch:8123`), `migrationUrl` (native, e.g. `clickhouse://ch:9000`), `username`, `password`. With a `tls` block, use the TLS scheme/port (`https://…:8443`, `clickhouse://…:9440`).<br><br>`migrationUrl`, `username` and `password` are **required**: the migration Job exits non-zero without them. The `url` must be an origin — never put a database or path in it, as ClickHouse's HTTP interface selects the database by parameter, not path. Use `clickhouse.database` instead. |
 | `tls` | [`ClickHouseTLSSpec`](#clickhousetlsspec) | TLS for the ClickHouse connection. |
 
 ### ClickHouseEncryptionSpec

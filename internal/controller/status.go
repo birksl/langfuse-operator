@@ -20,6 +20,10 @@ import (
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 )
 
+// ptrTo returns a pointer to v. Status booleans are pointers so that false is
+// distinguishable from "not yet determined" once serialised.
+func ptrTo[T any](v T) *T { return &v }
+
 // updateInstanceStatus writes status only when it differs from what was read.
 // Seven controllers watch this CR, so an unnecessary write costs seven
 // reconciles; original must be the DeepCopy taken right after the Get.

@@ -107,7 +107,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		// RetentionApplied reflects what ClickHouse actually accepted. It was
 		// previously set to true purely from computing the statements, so the CR
 		// claimed retention was active while data was retained forever.
-		instance.Status.ClickHouse.RetentionApplied = err == nil
+		instance.Status.ClickHouse.RetentionApplied = ptrTo(err == nil)
 
 		switch {
 		case err != nil:

@@ -544,6 +544,19 @@ type ClickHouseSpec struct {
 	// SchemaDrift configures schema drift detection.
 	// +optional
 	SchemaDrift *SchemaDriftSpec `json:"schemaDrift,omitempty"`
+	// Database is the ClickHouse database Langfuse reads and writes
+	// (CLICKHOUSE_DB), also used by schema-drift detection and retention.
+	//
+	// It must already exist: no Langfuse migration issues CREATE DATABASE, and
+	// neither does this operator. Never put the database in the connection URL —
+	// ClickHouse's HTTP interface selects it by parameter, not path, so a path
+	// makes every query fail.
+	//
+	// Defaults to "default" when unset. The operator emits CLICKHOUSE_DB only
+	// when this is set, so leaving it empty keeps existing pod templates
+	// byte-identical and avoids a rollout on upgrade.
+	// +optional
+	Database string `json:"database,omitempty"`
 }
 
 // ManagedClickHouseSpec deploys a managed ClickHouse instance.
@@ -1347,8 +1360,11 @@ type WorkerComponentStatus struct {
 
 // DatabaseStatus reports the state of the PostgreSQL database.
 type DatabaseStatus struct {
-	// Connected indicates if the database is reachable.
-	Connected bool `json:"connected,omitempty"`
+	// Connected indicates if the database is reachable. A pointer so that an
+	// unreachable store serialises as `connected: false` rather than being
+	// omitted, which is indistinguishable from never having been probed.
+	// +optional
+	Connected *bool `json:"connected,omitempty"`
 	// MigrationVersion is the current migration version.
 	// +optional
 	MigrationVersion string `json:"migrationVersion,omitempty"`
@@ -1366,32 +1382,41 @@ type BackgroundMigrationStatus struct {
 
 // ClickHouseStatus reports the state of ClickHouse.
 type ClickHouseStatus struct {
-	// Connected indicates if ClickHouse is reachable.
-	Connected bool `json:"connected,omitempty"`
+	// Connected indicates if ClickHouse is reachable. See DatabaseStatus.Connected
+	// for why this is a pointer.
+	// +optional
+	Connected *bool `json:"connected,omitempty"`
 	// StorageUsed is the current storage consumption.
 	// +optional
 	StorageUsed string `json:"storageUsed,omitempty"`
 	// StorageTotal is the total available storage.
 	// +optional
 	StorageTotal string `json:"storageTotal,omitempty"`
-	// SchemaDrift indicates if schema drift was detected.
+	// SchemaDrift indicates if schema drift was detected. See
+	// DatabaseStatus.Connected for why this is a pointer — absent means the
+	// check has not run (or is disabled), which is not the same as no drift.
 	// +optional
-	SchemaDrift bool `json:"schemaDrift,omitempty"`
-	// RetentionApplied indicates if retention policies are active.
+	SchemaDrift *bool `json:"schemaDrift,omitempty"`
+	// RetentionApplied indicates if retention policies are active. See
+	// DatabaseStatus.Connected for why this is a pointer.
 	// +optional
-	RetentionApplied bool `json:"retentionApplied,omitempty"`
+	RetentionApplied *bool `json:"retentionApplied,omitempty"`
 }
 
 // ConnectionStatus reports basic connection state.
 type ConnectionStatus struct {
-	// Connected indicates if the service is reachable.
-	Connected bool `json:"connected,omitempty"`
+	// Connected indicates if the service is reachable. See
+	// DatabaseStatus.Connected for why this is a pointer.
+	// +optional
+	Connected *bool `json:"connected,omitempty"`
 }
 
 // BlobStorageStatus reports the state of blob storage.
 type BlobStorageStatus struct {
-	// Connected indicates if blob storage is reachable.
-	Connected bool `json:"connected,omitempty"`
+	// Connected indicates if blob storage is reachable. See
+	// DatabaseStatus.Connected for why this is a pointer.
+	// +optional
+	Connected *bool `json:"connected,omitempty"`
 	// Provider is the blob storage provider in use.
 	// +optional
 	Provider string `json:"provider,omitempty"`

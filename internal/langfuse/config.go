@@ -380,6 +380,12 @@ func addClickHouseEnv(cfg *Config, instance *v1alpha1.LangfuseInstance) {
 	// Default to single-node mode; clustering requires ZooKeeper/Keeper
 	cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_CLUSTER_ENABLED", "false"))
 
+	// Only emitted when set. Langfuse and its migration script both default to
+	// "default", so staying silent keeps existing pod templates unchanged.
+	if ch.Database != "" {
+		cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_DB", ch.Database))
+	}
+
 	switch {
 	case ch.Managed != nil:
 		// Managed ClickHouse — credentials from generated or referenced secret

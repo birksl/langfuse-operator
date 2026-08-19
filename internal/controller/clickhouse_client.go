@@ -38,6 +38,16 @@ const clickHouseQueryTimeout = 15 * time.Second
 // defaultClickHouseDatabase matches Langfuse's CLICKHOUSE_DB default.
 const defaultClickHouseDatabase = "default"
 
+// clickHouseDatabase resolves the database Langfuse uses, so the operator's own
+// queries (schema drift, retention) target the same one the workload does.
+// Mirrors up.sh in the Langfuse image, which also falls back to "default".
+func clickHouseDatabase(instance *v1alpha1.LangfuseInstance) string {
+	if instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.Database != "" {
+		return instance.Spec.ClickHouse.Database
+	}
+	return defaultClickHouseDatabase
+}
+
 // clickHouseClient executes statements against ClickHouse's HTTP interface.
 //
 // The operator talks to ClickHouse directly (rather than through Langfuse) for
@@ -81,7 +91,7 @@ func newClickHouseClient(ctx context.Context, c client.Client, instance *v1alpha
 		endpoint: endpoint,
 		user:     user,
 		password: password,
-		database: defaultClickHouseDatabase,
+		database: clickHouseDatabase(instance),
 		http:     httpClient,
 	}, nil
 }

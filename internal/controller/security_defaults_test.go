@@ -81,5 +81,3 @@ var _ = Describe("SecuritySpec defaulting", func() {
 		Expect(*security.RunAsUser).To(BeEquivalentTo(2000))
 	})
 })
-
-func ptrTo[T any](v T) *T { return &v }

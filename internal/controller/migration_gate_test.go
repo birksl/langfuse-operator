@@ -68,6 +68,40 @@ func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
 	}
 }
 
+// The operator's own ClickHouse queries must target whatever database the
+// workload uses, or schema-drift detection reports phantom drift by looking in
+// the wrong place.
+func TestClickHouseDatabase(t *testing.T) {
+	cases := []struct {
+		name     string
+		instance *v1alpha1.LangfuseInstance
+		want     string
+	}{
+		{"no clickhouse block", &v1alpha1.LangfuseInstance{}, "default"},
+		{
+			name: "unset falls back to Langfuse's own default",
+			instance: &v1alpha1.LangfuseInstance{Spec: v1alpha1.LangfuseInstanceSpec{
+				ClickHouse: &v1alpha1.ClickHouseSpec{},
+			}},
+			want: "default",
+		},
+		{
+			name: "explicit database is honoured",
+			instance: &v1alpha1.LangfuseInstance{Spec: v1alpha1.LangfuseInstanceSpec{
+				ClickHouse: &v1alpha1.ClickHouseSpec{Database: "langfuse"},
+			}},
+			want: "langfuse",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clickHouseDatabase(tc.instance); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // up.sh exits 1 without CLICKHOUSE_MIGRATION_URL, CLICKHOUSE_USER or
 // CLICKHOUSE_PASSWORD, and the operator only emits those for keys present in
 // the spec — so a Job built without them can never succeed.

@@ -455,6 +455,20 @@ spec:
               clickhouse:
                 description: ClickHouse configures ClickHouse.
                 properties:
+                  database:
+                    description: |-
+                      Database is the ClickHouse database Langfuse reads and writes
+                      (CLICKHOUSE_DB), also used by schema-drift detection and retention.
+
+                      It must already exist: no Langfuse migration issues CREATE DATABASE, and
+                      neither does this operator. Never put the database in the connection URL —
+                      ClickHouse's HTTP interface selects it by parameter, not path, so a path
+                      makes every query fail.
+
+                      Defaults to "default" when unset. The operator emits CLICKHOUSE_DB only
+                      when this is set, so leaving it empty keeps existing pod templates
+                      byte-identical and avoids a rollout on upgrade.
+                    type: string
                   encryption:
                     description: Encryption configures ClickHouse encryption settings.
                     properties:
@@ -7417,7 +7431,9 @@ spec:
                 description: BlobStorage reports the state of blob storage.
                 properties:
                   connected:
-                    description: Connected indicates if blob storage is reachable.
+                    description: |-
+                      Connected indicates if blob storage is reachable. See
+                      DatabaseStatus.Connected for why this is a pointer.
                     type: boolean
                   provider:
                     description: Provider is the blob storage provider in use.
@@ -7427,14 +7443,20 @@ spec:
                 description: ClickHouse reports the state of ClickHouse.
                 properties:
                   connected:
-                    description: Connected indicates if ClickHouse is reachable.
+                    description: |-
+                      Connected indicates if ClickHouse is reachable. See DatabaseStatus.Connected
+                      for why this is a pointer.
                     type: boolean
                   retentionApplied:
-                    description: RetentionApplied indicates if retention policies
-                      are active.
+                    description: |-
+                      RetentionApplied indicates if retention policies are active. See
+                      DatabaseStatus.Connected for why this is a pointer.
                     type: boolean
                   schemaDrift:
-                    description: SchemaDrift indicates if schema drift was detected.
+                    description: |-
+                      SchemaDrift indicates if schema drift was detected. See
+                      DatabaseStatus.Connected for why this is a pointer — absent means the
+                      check has not run (or is disabled), which is not the same as no drift.
                     type: boolean
                   storageTotal:
                     description: StorageTotal is the total available storage.
@@ -7519,7 +7541,10 @@ spec:
                         type: integer
                     type: object
                   connected:
-                    description: Connected indicates if the database is reachable.
+                    description: |-
+                      Connected indicates if the database is reachable. A pointer so that an
+                      unreachable store serialises as `connected: false` rather than being
+                      omitted, which is indistinguishable from never having been probed.
                     type: boolean
                   migrationVersion:
                     description: MigrationVersion is the current migration version.
@@ -7609,7 +7634,9 @@ spec:
                 description: Redis reports the state of Redis.
                 properties:
                   connected:
-                    description: Connected indicates if the service is reachable.
+                    description: |-
+                      Connected indicates if the service is reachable. See
+                      DatabaseStatus.Connected for why this is a pointer.
                     type: boolean
                 type: object
               secrets:

@@ -888,6 +888,45 @@ func TestBuildConfig_ClickHouseTLS_DisabledByDefault(t *testing.T) {
 	}
 }
 
+// CLICKHOUSE_DB is the only supported way to target a non-default database:
+// ClickHouse's HTTP interface will not accept it as a URL path.
+func TestBuildConfig_ClickHouseDatabase(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+		Database: "langfuse",
+		External: &v1alpha1.ExternalClickHouseSpec{
+			SecretRef: v1alpha1.SecretKeysRef{Name: "ch-creds", Keys: map[string]string{"url": "url"}},
+		},
+	}
+
+	cfg, err := BuildConfig(instance)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+	if e, ok := envByName(cfg.CommonEnv, "CLICKHOUSE_DB"); !ok || e.Value != "langfuse" {
+		t.Errorf("CLICKHOUSE_DB = %q (found=%v), want langfuse", e.Value, ok)
+	}
+}
+
+// Staying silent when unset keeps existing pod templates byte-identical, so
+// upgrading the operator does not trigger a rollout.
+func TestBuildConfig_ClickHouseDatabase_OmittedWhenUnset(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+		External: &v1alpha1.ExternalClickHouseSpec{
+			SecretRef: v1alpha1.SecretKeysRef{Name: "ch-creds", Keys: map[string]string{"url": "url"}},
+		},
+	}
+
+	cfg, err := BuildConfig(instance)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+	if _, ok := envByName(cfg.CommonEnv, "CLICKHOUSE_DB"); ok {
+		t.Error("CLICKHOUSE_DB should not be set when spec.clickhouse.database is empty")
+	}
+}
+
 func TestBuildConfig_PostgresTLS_VerifyFull(t *testing.T) {
 	instance := minimalInstance()
 	instance.Spec.Database = &v1alpha1.DatabaseSpec{
