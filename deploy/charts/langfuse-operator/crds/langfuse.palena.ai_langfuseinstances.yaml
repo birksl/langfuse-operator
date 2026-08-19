@@ -7492,10 +7492,16 @@ spec:
                       check has not run (or is disabled), which is not the same as no drift.
                     type: boolean
                   storageTotal:
-                    description: StorageTotal is the total available storage.
+                    description: |-
+                      StorageTotal is the disk capacity of every ClickHouse node added together —
+                      the cluster's raw disks, not its usable capacity. The StoragePressure
+                      condition is evaluated per node rather than against this total, so a single
+                      node filling up is not averaged away.
                     type: string
                   storageUsed:
-                    description: StorageUsed is the current storage consumption.
+                    description: |-
+                      StorageUsed is the current storage consumption, summed across every
+                      ClickHouse node. Replicated data therefore counts once per replica.
                     type: string
                 type: object
               conditions:

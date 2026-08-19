@@ -230,7 +230,7 @@ func (r *RetentionController) applyRetention(ctx context.Context, instance *v1al
 func (r *RetentionController) evaluateStoragePressure(ctx context.Context, instance *v1alpha1.LangfuseInstance, pressure *v1alpha1.StoragePressureSpec) {
 	log := logf.FromContext(ctx)
 
-	used, total, err := r.queryDiskUsage(ctx, instance)
+	nodes, err := r.queryDiskUsage(ctx, instance)
 	if err != nil {
 		log.Error(err, "failed to query ClickHouse storage usage")
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
@@ -242,14 +242,15 @@ func (r *RetentionController) evaluateStoragePressure(ctx context.Context, insta
 		})
 		return
 	}
+	usage := summarizeDiskUsage(nodes)
 
 	if instance.Status.ClickHouse == nil {
 		instance.Status.ClickHouse = &v1alpha1.ClickHouseStatus{}
 	}
-	instance.Status.ClickHouse.StorageUsed = humanizeBytes(used)
-	instance.Status.ClickHouse.StorageTotal = humanizeBytes(total)
+	instance.Status.ClickHouse.StorageUsed = humanizeBytes(usage.used)
+	instance.Status.ClickHouse.StorageTotal = humanizeBytes(usage.total)
 
-	if total == 0 {
+	if usage.total == 0 {
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 			Type:               "StoragePressure",
 			Status:             metav1.ConditionUnknown,
@@ -260,10 +261,9 @@ func (r *RetentionController) evaluateStoragePressure(ctx context.Context, insta
 		return
 	}
 
-	usedPercent := int32(used * 100 / total)
+	usedPercent := usage.fullestPercent
 	warn, critical := pressure.WarningThresholdPercent, pressure.CriticalThresholdPercent
-	summary := fmt.Sprintf("ClickHouse storage %d%% used (%s of %s; warn=%d%%, critical=%d%%)",
-		usedPercent, humanizeBytes(used), humanizeBytes(total), warn, critical)
+	summary := usage.summary(warn, critical)
 
 	switch {
 	case critical > 0 && usedPercent >= critical:
@@ -296,35 +296,107 @@ func (r *RetentionController) evaluateStoragePressure(ctx context.Context, insta
 	}
 }
 
-// queryDiskUsage returns used and total bytes across ClickHouse's disks.
-func (r *RetentionController) queryDiskUsage(ctx context.Context, instance *v1alpha1.LangfuseInstance) (uint64, uint64, error) {
+// nodeDiskUsage is one ClickHouse node's disk totals.
+type nodeDiskUsage struct {
+	node        string
+	used, total uint64
+}
+
+// queryDiskUsage returns used and total bytes per ClickHouse node.
+//
+// system.disks is a local table: whichever node answers reports only its own
+// disks. Behind a Service that load-balances across pods that is one arbitrary
+// node per reconcile, so a clustered instance needs the cluster read through
+// clusterAllReplicas — otherwise the operator reports a fraction of the
+// cluster's storage as all of it, and never sees the node that is filling up.
+func (r *RetentionController) queryDiskUsage(ctx context.Context, instance *v1alpha1.LangfuseInstance) ([]nodeDiskUsage, error) {
 	ch, err := newClickHouseClient(ctx, r.Client, instance)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 
-	rows, err := ch.queryRows(ctx,
-		"SELECT sum(total_space - free_space), sum(total_space) FROM system.disks")
+	// The cluster name is fixed for the same reason the retention DDL's is.
+	source := "system.disks"
+	if instance.Spec.ClickHouse.ClusterEnabled() {
+		source = fmt.Sprintf("clusterAllReplicas('%s', system.disks)", langfuseClickHouseClusterName)
+	}
+	rows, err := ch.queryRows(ctx, fmt.Sprintf(
+		"SELECT hostName(), sum(total_space - free_space), sum(total_space) "+
+			"FROM %s GROUP BY hostName() ORDER BY hostName()", source))
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 	if len(rows) == 0 {
-		return 0, 0, fmt.Errorf("system.disks returned no rows")
+		return nil, fmt.Errorf("%s returned no rows", source)
 	}
 
-	fields := strings.Split(rows[0], "\t")
-	if len(fields) != 2 {
-		return 0, 0, fmt.Errorf("unexpected system.disks response %q", rows[0])
+	nodes := make([]nodeDiskUsage, 0, len(rows))
+	for _, row := range rows {
+		fields := strings.Split(row, "\t")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("unexpected %s response %q", source, row)
+		}
+		used, err := strconv.ParseUint(strings.TrimSpace(fields[1]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing used bytes: %w", err)
+		}
+		total, err := strconv.ParseUint(strings.TrimSpace(fields[2]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing total bytes: %w", err)
+		}
+		nodes = append(nodes, nodeDiskUsage{node: strings.TrimSpace(fields[0]), used: used, total: total})
 	}
-	used, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parsing used bytes: %w", err)
+	return nodes, nil
+}
+
+// diskUsage is what the status and the thresholds each need from per-node usage.
+type diskUsage struct {
+	nodes int
+	// used and total are summed across nodes, so replicated data counts once per
+	// replica — these are the cluster's raw disks, not its usable capacity.
+	used, total uint64
+	// fullest is the node with the highest utilisation, which is what the
+	// thresholds run off.
+	fullest        nodeDiskUsage
+	fullestPercent int32
+}
+
+// summarizeDiskUsage aggregates per-node usage.
+//
+// The thresholds follow the fullest node rather than the cluster average:
+// ClickHouse writes fail on whichever node runs out of disk, and averaging that
+// node together with its emptier peers hides it until it happens. Nodes are
+// already ordered by name, so equally full nodes resolve the same way every
+// reconcile instead of flapping the message.
+func summarizeDiskUsage(nodes []nodeDiskUsage) diskUsage {
+	usage := diskUsage{nodes: len(nodes)}
+	for _, n := range nodes {
+		usage.used += n.used
+		usage.total += n.total
+		if n.total == 0 {
+			continue
+		}
+		if percent := int32(n.used * 100 / n.total); usage.fullest.total == 0 || percent > usage.fullestPercent {
+			usage.fullest, usage.fullestPercent = n, percent
+		}
 	}
-	total, err := strconv.ParseUint(strings.TrimSpace(fields[1]), 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parsing total bytes: %w", err)
+	return usage
+}
+
+// summary describes the usage for the StoragePressure condition. On more than
+// one node it names the node the percentage came from, since that is the one to
+// act on, and keeps the cluster totals alongside it.
+func (d diskUsage) summary(warn, critical int32) string {
+	thresholds := fmt.Sprintf("warn=%d%%, critical=%d%%", warn, critical)
+	if d.nodes < 2 {
+		return fmt.Sprintf("ClickHouse storage %d%% used (%s of %s; %s)",
+			d.fullestPercent, humanizeBytes(d.used), humanizeBytes(d.total), thresholds)
 	}
-	return used, total, nil
+	return fmt.Sprintf("ClickHouse storage %d%% used on %s, the fullest of %d nodes "+
+		"(%s of %s; cluster total %s of %s; %s)",
+		d.fullestPercent, d.fullest.node, d.nodes,
+		humanizeBytes(d.fullest.used), humanizeBytes(d.fullest.total),
+		humanizeBytes(d.used), humanizeBytes(d.total), thresholds)
 }
 
 // humanizeBytes renders a byte count using binary units, matching how

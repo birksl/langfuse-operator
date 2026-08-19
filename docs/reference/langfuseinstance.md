@@ -60,6 +60,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `SecretsReady` | All secrets are generated/available |
 | `ClickHouseRetentionApplied` | TTL policies are active |
 | `ClickHouseSchemaDrift` | Schema drift detected |
+| `StoragePressure` | ClickHouse disk usage against the configured thresholds, measured on the fullest node — see [StoragePressureSpec](#storagepressurespec) |
 | `CircuitBreakerActive` | A circuit breaker is tripped |
 
 ---
@@ -406,10 +407,14 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `false` | Monitor ClickHouse storage pressure |
-| `warningThresholdPercent` | int32 | `75` | Emit a warning event above this |
-| `criticalThresholdPercent` | int32 | `90` | Begin pruning above this |
-| `pruneOldestPartitions` | bool | `false` | Drop oldest partitions when critical |
-| `minRetainDays` | int32 | `7` | Floor for retention even under pressure |
+| `warningThresholdPercent` | int32 | `75` | Report `StoragePressure=True` with reason `WarningThresholdExceeded` above this |
+| `criticalThresholdPercent` | int32 | `90` | Report `StoragePressure=True` with reason `CriticalThresholdExceeded` above this |
+| `pruneOldestPartitions` | bool | `false` | **Not implemented.** Dropping partitions is irreversible data loss, so the operator reports and leaves the decision to a human |
+| `minRetainDays` | int32 | `7` | Floor for retention even under pressure. Only meaningful once pruning exists |
+
+The percentage is the **fullest node's**, not the cluster average: ClickHouse writes fail on whichever node runs out of disk, and averaging it with emptier peers hides that until it happens. On a cluster the condition message names that node and carries the cluster totals beside its own.
+
+`storageUsed` and `storageTotal` in the status sum every node's disks, so replicated data counts once per replica — they describe the cluster's raw disks rather than its usable capacity. Reading them requires `clusterAllReplicas` when `clickhouse.cluster.enabled` is set, so a node that cannot be reached fails the read and reports `StoragePressure=Unknown` rather than a partial figure presented as the whole.
 
 ### SchemaDriftSpec
 

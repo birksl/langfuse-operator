@@ -1436,10 +1436,14 @@ type ClickHouseStatus struct {
 	// for why this is a pointer.
 	// +optional
 	Connected *bool `json:"connected,omitempty"`
-	// StorageUsed is the current storage consumption.
+	// StorageUsed is the current storage consumption, summed across every
+	// ClickHouse node. Replicated data therefore counts once per replica.
 	// +optional
 	StorageUsed string `json:"storageUsed,omitempty"`
-	// StorageTotal is the total available storage.
+	// StorageTotal is the disk capacity of every ClickHouse node added together —
+	// the cluster's raw disks, not its usable capacity. The StoragePressure
+	// condition is evaluated per node rather than against this total, so a single
+	// node filling up is not averaged away.
 	// +optional
 	StorageTotal string `json:"storageTotal,omitempty"`
 	// SchemaDrift indicates if schema drift was detected. See
