@@ -22,6 +22,9 @@ go.work
 # Build output from `make build-installer`
 dist/
 
+# Local clone of langfuse/langfuse for cross-referencing upstream behaviour
+.langfuse-upstream/
+
 # Documentation site
 docs/node_modules
 docs/.vitepress/cache
