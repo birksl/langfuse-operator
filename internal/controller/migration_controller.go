@@ -69,6 +69,30 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	original := instance.DeepCopy()
 
+	// The identity covers the ClickHouse database and the datastore references as
+	// well as the tag: pointing an unchanged image at a different database or
+	// Secret gives the workload a target that has no schema.
+	desiredTag := instance.Spec.Image.Tag
+	desiredIdentity := migrationIdentity(instance)
+
+	// Establish a baseline for instances migrated before appliedIdentity existed.
+	// Their status records only a version, so the reference and key components
+	// have nothing to compare against and a later repoint would pass unnoticed.
+	// This runs ahead of the runOnDeploy check because it writes status only — it
+	// starts no migration — and an instance with migrations disabled still needs
+	// the workload freeze to work.
+	if baseline, ok := legacyBaselineIdentity(instance, desiredIdentity); ok {
+		if instance.Status.Migration == nil {
+			instance.Status.Migration = &v1alpha1.MigrationStatus{}
+		}
+		instance.Status.Migration.AppliedIdentity = baseline
+		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
+			return ctrl.Result{}, fmt.Errorf("recording migration baseline: %w", err)
+		}
+		log.Info("recorded a migration baseline for a pre-existing instance", "identity", baseline)
+		return ctrl.Result{}, nil
+	}
+
 	// Skip if migration is disabled
 	if instance.Spec.Database != nil && instance.Spec.Database.Migration != nil &&
 		instance.Spec.Database.Migration.RunOnDeploy != nil && !*instance.Spec.Database.Migration.RunOnDeploy {
@@ -79,12 +103,6 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Status.Version is written by the instance controller on every pass and
 	// means "deployed", so whichever controller won the race on a fresh CR
 	// decided whether migrations ever ran — and once set it never reopened.
-	//
-	// The identity covers the ClickHouse database as well as the tag: pointing
-	// an unchanged image at a different database gives the workload a new
-	// CLICKHOUSE_DB, and that database needs its tables.
-	desiredTag := instance.Spec.Image.Tag
-	desiredIdentity := migrationIdentity(instance)
 	if migrationUpToDate(appliedMigrationIdentity(instance), desiredIdentity) {
 		// Nothing to migrate, check if an existing Job needs cleanup
 		return r.cleanupCompletedJobs(ctx, instance)
@@ -381,9 +399,13 @@ func buildMigrationIdentity(t migrationTarget) string {
 		migrationIdentityDatabaseKey, t.clickHouseDB)
 }
 
-// postgresRefName names the Secret or CNPG Cluster the schema lives behind.
-// Only the reference is used, never its contents: reading the Secret would make
-// a rotated credential look like a new datastore.
+// postgresRefName names the Secret or CNPG Cluster the schema lives behind,
+// together with the key that selects the endpoint inside it — a Secret can hold
+// several, so the name alone does not identify a datastore.
+//
+// Only references and key names are used, never their values: reading the Secret
+// would make a rotated credential look like a new datastore. Credential keys are
+// excluded for the same reason; only the keys that choose an endpoint count.
 func postgresRefName(instance *v1alpha1.LangfuseInstance) string {
 	db := instance.Spec.Database
 	switch {
@@ -392,7 +414,8 @@ func postgresRefName(instance *v1alpha1.LangfuseInstance) string {
 	case db.CloudNativePG != nil:
 		return "cnpg/" + db.CloudNativePG.ClusterRef.Name
 	case db.External != nil:
-		return "secret/" + db.External.SecretRef.Name
+		return fmt.Sprintf("secret/%s#url=%s",
+			db.External.SecretRef.Name, postgresURLKey(db.External.SecretRef))
 	}
 	return ""
 }
@@ -405,9 +428,29 @@ func clickHouseRefName(instance *v1alpha1.LangfuseInstance) string {
 	case ch.Managed != nil:
 		return "managed"
 	case ch.External != nil:
-		return "secret/" + ch.External.SecretRef.Name
+		return fmt.Sprintf("secret/%s#url=%s,migrationUrl=%s",
+			ch.External.SecretRef.Name,
+			clickHouseURLKey(ch.External.SecretRef),
+			ch.External.SecretRef.Keys["migrationUrl"])
 	}
 	return ""
+}
+
+// postgresURLKey and clickHouseURLKey resolve the endpoint key the same way the
+// env config and the probes do, so omitting a mapping and setting it explicitly
+// to its default describe the same target rather than looking like a move.
+func postgresURLKey(ref v1alpha1.SecretKeysRef) string {
+	if key := ref.Keys["url"]; key != "" {
+		return key
+	}
+	return "database_url"
+}
+
+func clickHouseURLKey(ref v1alpha1.SecretKeysRef) string {
+	if key := ref.Keys["url"]; key != "" {
+		return key
+	}
+	return "url"
 }
 
 const (
@@ -554,6 +597,33 @@ func appliedMigrationIdentity(instance *v1alpha1.LangfuseInstance) string {
 			migrationIdentityDatabaseKey, defaultClickHouseDatabase)
 	}
 	return ""
+}
+
+// legacyBaselineIdentity returns the identity to persist for an instance that
+// migrated before appliedIdentity existed, and whether there is one to persist.
+//
+// Such an instance records only status.database.migrationVersion, so the
+// components added since — the datastore references, their endpoint keys, the
+// clustering mode — have nothing to compare against and are skipped. That is the
+// right call for one reconcile, but left unpersisted it is permanent: a Secret or
+// key repointed later would never register as a change. Writing the full current
+// identity once fixes the baseline.
+//
+// It only fires when the components that *were* recorded still match the spec.
+// If they differ the target has already moved, and recording the new one would
+// launder a retarget into an applied state and lose the detection for good.
+func legacyBaselineIdentity(instance *v1alpha1.LangfuseInstance, desired string) (string, bool) {
+	if instance.Status.Migration != nil && instance.Status.Migration.AppliedIdentity != "" {
+		return "", false // already baselined
+	}
+	legacy := appliedMigrationIdentity(instance)
+	if legacy == "" {
+		return "", false // never migrated; the first real migration records it
+	}
+	if !migrationUpToDate(legacy, desired) {
+		return "", false
+	}
+	return desired, true
 }
 
 // missingClickHouseMigrationKeys lists the logical secret keys that external

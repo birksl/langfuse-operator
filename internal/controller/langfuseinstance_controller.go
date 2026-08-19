@@ -139,7 +139,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				strings.Join(changed, " and ")),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := r.updateStatus(ctx, instance, original); statusErr != nil {
+		if statusErr := r.updateStatus(ctx, instance, original, false); statusErr != nil {
 			log.Error(statusErr, "failed to update status")
 		}
 		log.Error(nil, "refusing to reconcile workloads onto a retargeted datastore", "changed", changed)
@@ -215,7 +215,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// 14. Update status
-	if err := r.updateStatus(ctx, instance, original); err != nil {
+	if err := r.updateStatus(ctx, instance, original, true); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
@@ -306,7 +306,10 @@ func (r *LangfuseInstanceReconciler) apply(ctx context.Context, instance *v1alph
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance, original *v1alpha1.LangfuseInstance) error {
+// updateStatus refreshes observed state and derives phase. workloadApplied says
+// whether this pass actually reconciled the Deployments; when it did not, fields
+// that describe what is running are left as they were.
+func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance, original *v1alpha1.LangfuseInstance, workloadApplied bool) error {
 	// Fetch current deployment states
 	webDeploy := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: resources.WebName(instance), Namespace: instance.Namespace}, webDeploy); err != nil {
@@ -340,8 +343,14 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance,
 
 	instance.Status.Phase, instance.Status.Ready = derivePhase(instance)
 
-	instance.Status.Version = instance.Spec.Image.Tag
-	instance.Status.PublicUrl = instance.Spec.Auth.NextAuthUrl
+	// Only advance these once the spec has actually been applied to the
+	// Deployments. On a frozen reconcile the pods still run the previous image and
+	// URL, so publishing the spec's values would claim a rollout that never
+	// happened — and with migrations disabled it would claim it indefinitely.
+	if workloadApplied {
+		instance.Status.Version = instance.Spec.Image.Tag
+		instance.Status.PublicUrl = instance.Spec.Auth.NextAuthUrl
+	}
 
 	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 		Type:               conditionTypeReady,
