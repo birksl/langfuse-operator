@@ -1383,10 +1383,13 @@ type MigrationStatus struct {
 	// +optional
 	Issues []PodIssue `json:"issues,omitempty"`
 	// AppliedIdentity records what the last successful migration actually ran
-	// against — the image tag together with the ClickHouse database. Migrations
-	// re-run whenever it changes, so retargeting an empty database does not
-	// leave it without tables. The same value is stamped on the migration Job,
-	// so a Job left over from another version is never mistaken for this one's.
+	// against: the image tag, the datastore references and the endpoint keys
+	// inside them, and the ClickHouse database and clustering mode. Migrations
+	// re-run when the version changes, so retargeting an empty database does not
+	// leave it without tables; a reference change is refused instead, because the
+	// existing schema does not move with it. The same value is stamped on the
+	// migration Job, so a Job left over from another target is never mistaken for
+	// this one's.
 	// +optional
 	AppliedIdentity string `json:"appliedIdentity,omitempty"`
 }

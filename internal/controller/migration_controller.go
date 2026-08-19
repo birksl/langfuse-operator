@@ -357,16 +357,14 @@ func (r *MigrationController) cleanupCompletedJobs(ctx context.Context, instance
 // to migrate, so its success is only ever credited to that target.
 const migrationIdentityAnnotation = "langfuse.palena.ai/migration-identity"
 
-// migrationIdentity describes everything spec-visible that determines what a
-// migration produces: the Langfuse version and the ClickHouse database it
-// creates tables in.
+// migrationIdentity describes everything spec-visible that decides what a
+// migration produces and where it lands: the Langfuse version, the datastores it
+// runs against, and the ClickHouse database and clustering mode its tables are
+// created with.
 //
-// The Postgres and ClickHouse endpoints are deliberately absent. They come from
-// Secrets the operator would have to read on every pass, and a rotated
-// credential would look like a new target. Repointing an instance at a fresh
-// cluster by editing its Secret therefore does not re-trigger migrations — set
-// spec.clickhouse.database, or clear status.migration.appliedIdentity, to force
-// them.
+// Datastores are identified by reference and endpoint key name only, never by the
+// values behind them — reading the Secrets would make a rotated credential look
+// like a new datastore.
 func migrationIdentity(instance *v1alpha1.LangfuseInstance) string {
 	return buildMigrationIdentity(migrationTarget{
 		version:         instance.Spec.Image.Tag,
@@ -400,12 +398,13 @@ func buildMigrationIdentity(t migrationTarget) string {
 }
 
 // postgresRefName names the Secret or CNPG Cluster the schema lives behind,
-// together with the key that selects the endpoint inside it — a Secret can hold
+// together with the keys that select an endpoint inside it — a Secret can hold
 // several, so the name alone does not identify a datastore.
 //
-// Only references and key names are used, never their values: reading the Secret
-// would make a rotated credential look like a new datastore. Credential keys are
-// excluded for the same reason; only the keys that choose an endpoint count.
+// directUrl counts as much as url: Langfuse's Prisma datasource declares
+// directUrl = env("DIRECT_URL"), and prisma migrate deploy prefers it when set,
+// so it — not url — is where the schema actually lands. Credential keys are
+// excluded; rotating a password does not change which datastore this is.
 func postgresRefName(instance *v1alpha1.LangfuseInstance) string {
 	db := instance.Spec.Database
 	switch {
@@ -414,8 +413,10 @@ func postgresRefName(instance *v1alpha1.LangfuseInstance) string {
 	case db.CloudNativePG != nil:
 		return "cnpg/" + db.CloudNativePG.ClusterRef.Name
 	case db.External != nil:
-		return fmt.Sprintf("secret/%s#url=%s",
-			db.External.SecretRef.Name, postgresURLKey(db.External.SecretRef))
+		return fmt.Sprintf("secret/%s#url=%s,directUrl=%s",
+			db.External.SecretRef.Name,
+			postgresURLKey(db.External.SecretRef),
+			db.External.SecretRef.Keys["directUrl"])
 	}
 	return ""
 }
@@ -475,7 +476,8 @@ const (
 // identity may predate a component: those written before the datastore references
 // were tracked carry only version, clustering and database. Whole-string equality
 // would make every such instance look stale and re-migrate on an operator
-// upgrade, and would do so again the next time a component is added.
+// upgrade, and would do so again the next time a component is added. References
+// get the same treatment one level down, per endpoint key.
 func migrationUpToDate(applied, desired string) bool {
 	if applied == "" {
 		return false
@@ -486,13 +488,17 @@ func migrationUpToDate(applied, desired string) bool {
 	for _, key := range []string{
 		migrationIdentityPostgresRefKey,
 		migrationIdentityClickHouseRefKey,
-		migrationIdentityClusterKey,
 	} {
 		was, ok := identityComponent(applied, key)
 		if !ok {
 			continue
 		}
-		if want, _ := identityComponent(desired, key); was != want {
+		if want, _ := identityComponent(desired, key); !refsAgree(was, want) {
+			return false
+		}
+	}
+	if was, ok := identityClusterMode(applied); ok {
+		if want, _ := identityClusterMode(desired); was != want {
 			return false
 		}
 	}
@@ -525,6 +531,46 @@ func identityClusterMode(identity string) (string, bool) {
 	return identityComponent(identity, migrationIdentityClusterKey)
 }
 
+// identityLookup adapts a prefixed component to the lookup signature used below.
+func identityLookup(key string) func(string) (string, bool) {
+	return func(identity string) (string, bool) { return identityComponent(identity, key) }
+}
+
+// refsAgree reports whether a recorded reference still describes the desired one.
+// The object name must match, and so must every endpoint key the recording
+// carries — but only those: the set of keys tracked has grown, and a reference
+// written before a key was tracked must not read as a move. That is the rule
+// migrationUpToDate applies to whole components, applied per key.
+func refsAgree(applied, desired string) bool {
+	appliedName, appliedKeys := splitRef(applied)
+	desiredName, desiredKeys := splitRef(desired)
+	if appliedName != desiredName {
+		return false
+	}
+	for key, was := range appliedKeys {
+		if want, ok := desiredKeys[key]; !ok || was != want {
+			return false
+		}
+	}
+	return true
+}
+
+// splitRef separates a reference into its object name and its endpoint key
+// mappings: "secret/pg#url=database_url,directUrl=direct_url". Neither separator
+// can occur in a Secret name or a Secret key, so the split is unambiguous.
+func splitRef(ref string) (string, map[string]string) {
+	name, mappings, found := strings.Cut(ref, "#")
+	if !found {
+		return name, nil
+	}
+	keys := make(map[string]string)
+	for _, mapping := range strings.Split(mappings, ",") {
+		key, value, _ := strings.Cut(mapping, "=")
+		keys[key] = value
+	}
+	return name, keys
+}
+
 // retargetedComponents lists which parts of the datastore target differ from
 // what the last successful migration used. Both are fixed when the schema is
 // created: pointing at another database orphans every row already written, and
@@ -540,27 +586,23 @@ func retargetedComponents(applied, desired string) []string {
 
 	// Each component is compared only when the recorded identity carries it, so
 	// identities written before a component existed do not read as a retarget.
+	equal := func(was, want string) bool { return was == want }
 	var changed []string
 	for _, c := range []struct {
 		field  string
-		key    string
 		lookup func(string) (string, bool)
+		agree  func(was, want string) bool
 	}{
-		{"spec.database", migrationIdentityPostgresRefKey, nil},
-		{"spec.clickhouse (connection)", migrationIdentityClickHouseRefKey, nil},
-		{"spec.clickhouse.cluster.enabled", migrationIdentityClusterKey, nil},
-		{"spec.clickhouse.database", "", identityDatabase},
+		{"spec.database", identityLookup(migrationIdentityPostgresRefKey), refsAgree},
+		{"spec.clickhouse (connection)", identityLookup(migrationIdentityClickHouseRefKey), refsAgree},
+		{"spec.clickhouse.cluster.enabled", identityLookup(migrationIdentityClusterKey), equal},
+		{"spec.clickhouse.database", identityDatabase, equal},
 	} {
-		lookup := c.lookup
-		if lookup == nil {
-			key := c.key
-			lookup = func(identity string) (string, bool) { return identityComponent(identity, key) }
-		}
-		was, ok := lookup(applied)
+		was, ok := c.lookup(applied)
 		if !ok {
 			continue
 		}
-		if want, _ := lookup(desired); was != want {
+		if want, _ := c.lookup(desired); !c.agree(was, want) {
 			changed = append(changed, fmt.Sprintf("%s %q -> %q", c.field, was, want))
 		}
 	}

@@ -72,6 +72,11 @@ func externalInstance(tag string) *v1alpha1.LangfuseInstance {
 	}
 }
 
+func withPostgresDirectURL(instance *v1alpha1.LangfuseInstance, key string) *v1alpha1.LangfuseInstance {
+	instance.Spec.Database.External.SecretRef.Keys["directUrl"] = key
+	return instance
+}
+
 // An instance migrated before appliedIdentity existed records only a version, so
 // the components added since are skipped — correct for one pass, but permanent
 // unless the full identity is written down. Until it is, repointing a Secret goes
@@ -160,6 +165,42 @@ func TestMigrationIdentity_CoversEndpointKeys(t *testing.T) {
 		instance := externalInstance("3.126.0")
 		instance.Spec.ClickHouse.External.SecretRef.Keys["migrationUrl"] = "other_migration_url"
 		assertRetargeted(t, applied, migrationIdentity(instance), "spec.clickhouse (connection)")
+	})
+
+	// directUrl is where migrations actually run: Langfuse's Prisma datasource
+	// declares directUrl = env("DIRECT_URL"), and migrate deploy prefers it over
+	// url, so repointing it moves the schema even though the app keeps reading
+	// through url.
+	t.Run("postgres directUrl key added", func(t *testing.T) {
+		instance := withPostgresDirectURL(externalInstance("3.126.0"), "direct_url")
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.database")
+	})
+
+	t.Run("postgres directUrl key removed", func(t *testing.T) {
+		pooled := migrationIdentity(withPostgresDirectURL(externalInstance("3.126.0"), "direct_url"))
+		assertRetargeted(t, pooled, applied, "spec.database")
+	})
+
+	t.Run("postgres directUrl key changed", func(t *testing.T) {
+		pooled := migrationIdentity(withPostgresDirectURL(externalInstance("3.126.0"), "direct_url"))
+		moved := withPostgresDirectURL(externalInstance("3.126.0"), "other_direct_url")
+		assertRetargeted(t, pooled, migrationIdentity(moved), "spec.database")
+	})
+
+	t.Run("a reference recorded before directUrl was tracked is not a move", func(t *testing.T) {
+		// The key set has grown twice already. An identity written by an earlier
+		// build records the keys it knew about, and the ones it did not must not
+		// read as a repoint — the same rule whole components get.
+		recorded := "3.126.0|postgres-ref=secret/pg#url=database_url" +
+			"|clickhouse-ref=secret/ch#url=url,migrationUrl=migration_url" +
+			"|clickhouse-cluster=false|clickhouse-db=default"
+		desired := migrationIdentity(withPostgresDirectURL(externalInstance("3.126.0"), "direct_url"))
+		if changed := retargetedComponents(recorded, desired); len(changed) != 0 {
+			t.Errorf("changed = %v, want none", changed)
+		}
+		if !migrationUpToDate(recorded, desired) {
+			t.Error("an identity predating the key must still count as applied")
+		}
 	})
 
 	t.Run("credential keys are not part of the target", func(t *testing.T) {
