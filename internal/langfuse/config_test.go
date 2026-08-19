@@ -888,6 +888,100 @@ func TestBuildConfig_ClickHouseTLS_DisabledByDefault(t *testing.T) {
 	}
 }
 
+// Clustering selects Langfuse's clustered migrations (Replicated*MergeTree with
+// ON CLUSTER DDL). It stays off by default, matching upstream's docker-compose
+// rather than their env-schema default of true.
+func TestBuildConfig_ClickHouseCluster(t *testing.T) {
+	external := func(cluster *v1alpha1.ClickHouseClusterSpec) *v1alpha1.LangfuseInstance {
+		instance := minimalInstance()
+		instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+			Cluster: cluster,
+			External: &v1alpha1.ExternalClickHouseSpec{
+				SecretRef: v1alpha1.SecretKeysRef{Name: "ch-creds", Keys: map[string]string{"url": "url"}},
+			},
+		}
+		return instance
+	}
+
+	cases := []struct {
+		name     string
+		instance *v1alpha1.LangfuseInstance
+		want     string
+	}{
+		{"unset stays off", external(nil), "false"},
+		{"explicitly off", external(&v1alpha1.ClickHouseClusterSpec{Enabled: false}), "false"},
+		{"enabled", external(&v1alpha1.ClickHouseClusterSpec{Enabled: true}), "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := BuildConfig(tc.instance)
+			if err != nil {
+				t.Fatalf("BuildConfig() error: %v", err)
+			}
+			if e, ok := envByName(cfg.CommonEnv, "CLICKHOUSE_CLUSTER_ENABLED"); !ok || e.Value != tc.want {
+				t.Errorf("CLICKHOUSE_CLUSTER_ENABLED = %q (found=%v), want %q", e.Value, ok, tc.want)
+			}
+		})
+	}
+}
+
+// The managed mode is a single node with no Keeper, so clustering there would
+// produce ON CLUSTER DDL against a cluster that does not exist.
+func TestBuildConfig_ClickHouseCluster_RejectedForManaged(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+		Managed: &v1alpha1.ManagedClickHouseSpec{},
+		Cluster: &v1alpha1.ClickHouseClusterSpec{Enabled: true},
+	}
+
+	_, err := BuildConfig(instance)
+	if err == nil {
+		t.Fatal("want an error for cluster.enabled with managed ClickHouse")
+	}
+	if !strings.Contains(err.Error(), "spec.clickhouse.cluster.enabled") {
+		t.Errorf("error %q should name the offending field", err)
+	}
+}
+
+// CLICKHOUSE_DB is the only supported way to target a non-default database:
+// ClickHouse's HTTP interface will not accept it as a URL path.
+func TestBuildConfig_ClickHouseDatabase(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+		Database: "langfuse",
+		External: &v1alpha1.ExternalClickHouseSpec{
+			SecretRef: v1alpha1.SecretKeysRef{Name: "ch-creds", Keys: map[string]string{"url": "url"}},
+		},
+	}
+
+	cfg, err := BuildConfig(instance)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+	if e, ok := envByName(cfg.CommonEnv, "CLICKHOUSE_DB"); !ok || e.Value != "langfuse" {
+		t.Errorf("CLICKHOUSE_DB = %q (found=%v), want langfuse", e.Value, ok)
+	}
+}
+
+// Staying silent when unset keeps existing pod templates byte-identical, so
+// upgrading the operator does not trigger a rollout.
+func TestBuildConfig_ClickHouseDatabase_OmittedWhenUnset(t *testing.T) {
+	instance := minimalInstance()
+	instance.Spec.ClickHouse = &v1alpha1.ClickHouseSpec{
+		External: &v1alpha1.ExternalClickHouseSpec{
+			SecretRef: v1alpha1.SecretKeysRef{Name: "ch-creds", Keys: map[string]string{"url": "url"}},
+		},
+	}
+
+	cfg, err := BuildConfig(instance)
+	if err != nil {
+		t.Fatalf("BuildConfig() error: %v", err)
+	}
+	if _, ok := envByName(cfg.CommonEnv, "CLICKHOUSE_DB"); ok {
+		t.Error("CLICKHOUSE_DB should not be set when spec.clickhouse.database is empty")
+	}
+}
+
 func TestBuildConfig_PostgresTLS_VerifyFull(t *testing.T) {
 	instance := minimalInstance()
 	instance.Spec.Database = &v1alpha1.DatabaseSpec{

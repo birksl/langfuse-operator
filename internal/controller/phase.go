@@ -47,6 +47,11 @@ func derivePhase(instance *v1alpha1.LangfuseInstance) (phase string, ready bool)
 	anyUnhealthy, allHealthy := dependencyHealth(instance)
 
 	switch {
+	case datastoreTargetChanged(instance):
+		// The workload is frozen on its previous config, so nothing about the
+		// current spec is running. Error rather than Degraded: it needs the spec
+		// reverted, or a separate instance for the new target.
+		return phaseError, false
 	case migrationFailed(instance) || instanceHasFatalPodIssue(instance):
 		return phaseError, false
 	case migrationRunning(instance):
@@ -83,6 +88,14 @@ func dependencyHealth(instance *v1alpha1.LangfuseInstance) (anyUnhealthy, allHea
 		}
 	}
 	return false, allHealthy
+}
+
+// datastoreTargetChanged reports whether the instance controller has frozen
+// workload reconciliation because the spec points at a datastore the current
+// schema does not live in.
+func datastoreTargetChanged(instance *v1alpha1.LangfuseInstance) bool {
+	condition := meta.FindStatusCondition(instance.Status.Conditions, conditionTypeDatastoreTarget)
+	return condition != nil && condition.Status == metav1.ConditionFalse
 }
 
 func migrationRunning(instance *v1alpha1.LangfuseInstance) bool {

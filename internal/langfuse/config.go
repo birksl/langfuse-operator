@@ -82,7 +82,9 @@ func BuildConfig(instance *v1alpha1.LangfuseInstance) (*Config, error) {
 	}
 
 	// ─── ClickHouse ───────────────────────────────────────────
-	addClickHouseEnv(cfg, instance)
+	if err := addClickHouseEnv(cfg, instance); err != nil {
+		return nil, err
+	}
 
 	// ─── Redis ────────────────────────────────────────────────
 	if err := addRedisEnv(cfg, instance, trustedCAPath); err != nil {
@@ -370,15 +372,31 @@ func postgresTLSQuery(tls *v1alpha1.DatabaseTLSSpec, trustedCAPath string, cfg *
 	return "?" + strings.Join(params, "&")
 }
 
-func addClickHouseEnv(cfg *Config, instance *v1alpha1.LangfuseInstance) {
+func addClickHouseEnv(cfg *Config, instance *v1alpha1.LangfuseInstance) error {
 	if instance.Spec.ClickHouse == nil {
-		return
+		return nil
 	}
 
 	ch := instance.Spec.ClickHouse
 
-	// Default to single-node mode; clustering requires ZooKeeper/Keeper
-	cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_CLUSTER_ENABLED", "false"))
+	// Clustering selects Langfuse's clustered migrations — Replicated*MergeTree
+	// tables with ON CLUSTER DDL — and clusterAllReplicas at query time. Only
+	// meaningful against a real replicated cluster with Keeper, so it stays off
+	// unless asked for, matching upstream's docker-compose default rather than
+	// their env-schema default of true.
+	if ch.Managed != nil && instance.Spec.ClickHouse.ClusterEnabled() {
+		return fmt.Errorf("spec.clickhouse.cluster.enabled is not supported with " +
+			"spec.clickhouse.managed: the managed mode is a single node with no Keeper. " +
+			"Use spec.clickhouse.external against a replicated cluster")
+	}
+	cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_CLUSTER_ENABLED",
+		strconv.FormatBool(instance.Spec.ClickHouse.ClusterEnabled())))
+
+	// Only emitted when set. Langfuse and its migration script both default to
+	// "default", so staying silent keeps existing pod templates unchanged.
+	if ch.Database != "" {
+		cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_DB", ch.Database))
+	}
 
 	switch {
 	case ch.Managed != nil:
@@ -434,6 +452,8 @@ func addClickHouseEnv(cfg *Config, instance *v1alpha1.LangfuseInstance) {
 			cfg.CommonEnv = append(cfg.CommonEnv, envVar("CLICKHOUSE_MIGRATION_SSL", "true"))
 		}
 	}
+
+	return nil
 }
 
 func addRedisEnv(cfg *Config, instance *v1alpha1.LangfuseInstance, trustedCAPath string) error {

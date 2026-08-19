@@ -1,0 +1,505 @@
+/*
+Copyright 2026 bitkaio LLC.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
+package controller
+
+import (
+	"strings"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
+)
+
+// The gate must read the version this controller migrated, not the one the
+// instance controller deployed. Status.Version is stamped on every instance
+// reconcile, so gating on it meant whichever controller won the race on a fresh
+// CR decided whether migrations ever ran — and it never reopened afterwards.
+func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
+	cases := []struct {
+		name              string
+		deployedVersion   string // status.version, written by the instance controller
+		migratedVersion   string // status.database.migrationVersion, written here
+		tag               string
+		wantShouldMigrate bool
+	}{
+		{
+			name:            "fresh instance the instance controller already stamped",
+			deployedVersion: "3.126.0", migratedVersion: "", tag: "3.126.0",
+			wantShouldMigrate: true, // the bug: this used to be skipped forever
+		},
+		{"never migrated", "", "", "3.126.0", true},
+		{"already migrated same version", "3.126.0", "3.126.0", "3.126.0", false},
+		{"upgrade", "3.126.0", "3.100.0", "3.126.0", true},
+		{"normalised v-prefix counts as migrated", "3.126.0", "3.126.0", "v3.126.0", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			instance := &v1alpha1.LangfuseInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "lf", Namespace: "ns"},
+				Spec:       v1alpha1.LangfuseInstanceSpec{Image: v1alpha1.ImageSpec{Tag: tc.tag}},
+				Status:     v1alpha1.LangfuseInstanceStatus{Version: tc.deployedVersion},
+			}
+			if tc.migratedVersion != "" {
+				instance.Status.Database = &v1alpha1.DatabaseStatus{MigrationVersion: tc.migratedVersion}
+			}
+
+			shouldMigrate := !migrationUpToDate(
+				appliedMigrationIdentity(instance), migrationIdentity(instance))
+
+			if shouldMigrate != tc.wantShouldMigrate {
+				t.Errorf("shouldMigrate = %v, want %v (deployed=%q migrated=%q tag=%q)",
+					shouldMigrate, tc.wantShouldMigrate, tc.deployedVersion, tc.migratedVersion, tc.tag)
+			}
+		})
+	}
+}
+
+// testIdentity builds an identity varying only the components most tests care
+// about, leaving the datastore references empty and therefore equal.
+func testIdentity(version, database string, clustered bool) string {
+	return buildMigrationIdentity(migrationTarget{
+		version:         version,
+		clickHouseDB:    database,
+		clickHouseClust: clustered,
+	})
+}
+
+// The gate must reopen when the migration target changes, not only the tag —
+// otherwise repointing at a different (empty) ClickHouse database gives the
+// workload a new CLICKHOUSE_DB against a schema that was never created.
+//
+// Reopening is only the first stage: retargetedComponents then refuses a target
+// change on an already-migrated instance. This test covers the gate alone.
+func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
+	withStatus := func(tag, appliedIdentity, legacyVersion, database string) *v1alpha1.LangfuseInstance {
+		instance := &v1alpha1.LangfuseInstance{
+			Spec: v1alpha1.LangfuseInstanceSpec{
+				Image:      v1alpha1.ImageSpec{Tag: tag},
+				ClickHouse: &v1alpha1.ClickHouseSpec{Database: database},
+			},
+		}
+		if appliedIdentity != "" {
+			instance.Status.Migration = &v1alpha1.MigrationStatus{AppliedIdentity: appliedIdentity}
+		}
+		if legacyVersion != "" {
+			instance.Status.Database = &v1alpha1.DatabaseStatus{MigrationVersion: legacyVersion}
+		}
+		return instance
+	}
+
+	cases := []struct {
+		name              string
+		instance          *v1alpha1.LangfuseInstance
+		wantShouldMigrate bool
+	}{
+		{
+			name:              "same tag and database — nothing to do",
+			instance:          withStatus("3.126.0", testIdentity("3.126.0", "langfuse", false), "", "langfuse"),
+			wantShouldMigrate: false,
+		},
+		{
+			name:              "database retargeted on an unchanged tag",
+			instance:          withStatus("3.126.0", testIdentity("3.126.0", "old", false), "", "new"),
+			wantShouldMigrate: true,
+		},
+		{
+			name:              "tag upgraded on an unchanged database",
+			instance:          withStatus("3.126.0", testIdentity("3.100.0", "langfuse", false), "", "langfuse"),
+			wantShouldMigrate: true,
+		},
+		{
+			// Migrated by an operator predating appliedIdentity: it necessarily
+			// ran against "default", so back-filling avoids a spurious re-run.
+			name:              "legacy status, still on default",
+			instance:          withStatus("3.126.0", "", "3.126.0", ""),
+			wantShouldMigrate: false,
+		},
+		{
+			name:              "legacy status, now retargeted off default",
+			instance:          withStatus("3.126.0", "", "3.126.0", "langfuse"),
+			wantShouldMigrate: true,
+		},
+		{
+			name:              "never migrated",
+			instance:          withStatus("3.126.0", "", "", "langfuse"),
+			wantShouldMigrate: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shouldMigrate := !migrationUpToDate(
+				appliedMigrationIdentity(tc.instance), migrationIdentity(tc.instance))
+			if shouldMigrate != tc.wantShouldMigrate {
+				t.Errorf("shouldMigrate = %v, want %v (applied=%q desired=%q)",
+					shouldMigrate, tc.wantShouldMigrate,
+					appliedMigrationIdentity(tc.instance), migrationIdentity(tc.instance))
+			}
+		})
+	}
+}
+
+// A succeeded Job outlives its migration by TTLSecondsAfterFinished (1h), and
+// its name carries no version — so an upgrade inside that window must not read
+// the old Job's success as its own.
+func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
+	instance := &v1alpha1.LangfuseInstance{
+		Spec: v1alpha1.LangfuseInstanceSpec{
+			Image:      v1alpha1.ImageSpec{Tag: "3.126.0"},
+			ClickHouse: &v1alpha1.ClickHouseSpec{Database: "langfuse"},
+		},
+	}
+	desired := migrationIdentity(instance)
+
+	previousVersion := testIdentity("3.100.0", "langfuse", false)
+	if previousVersion == desired {
+		t.Error("a Job from the previous version must not match the desired identity")
+	}
+
+	otherDatabase := testIdentity("3.126.0", "other", false)
+	if otherDatabase == desired {
+		t.Error("a Job for another database must not match the desired identity")
+	}
+
+	// A Job predating the annotation has no identity at all, so it is replaced
+	// rather than trusted.
+	if desired == "" {
+		t.Error("desired identity must never be empty, or an unannotated Job would match it")
+	}
+
+	// The v-prefix is normalised away, so v3.126.0 and 3.126.0 are one target.
+	if got := testIdentity("v3.126.0", "langfuse", false); got != desired {
+		t.Errorf("normalised identity = %q, want %q", got, desired)
+	}
+}
+
+// Clustering fixes the table engine at CREATE time, so it must be recoverable
+// from a recorded identity — that is how the controller tells a switch it cannot
+// perform from a re-migration it can.
+func TestIdentityClusterMode(t *testing.T) {
+	clustered := testIdentity("3.126.0", "langfuse", true)
+	unclustered := testIdentity("3.126.0", "langfuse", false)
+
+	if clustered == unclustered {
+		t.Fatal("clustered and unclustered identities must differ")
+	}
+
+	mode, ok := identityClusterMode(clustered)
+	if !ok || mode != "true" {
+		t.Errorf("clustered mode = %q (found=%v), want true", mode, ok)
+	}
+	mode, ok = identityClusterMode(unclustered)
+	if !ok || mode != "false" {
+		t.Errorf("unclustered mode = %q (found=%v), want false", mode, ok)
+	}
+
+	// A database name containing the separator must not confuse extraction.
+	if mode, _ := identityClusterMode(testIdentity("3.126.0", "db-clickhouse-cluster=x", true)); mode != "true" {
+		t.Errorf("mode = %q, want true", mode)
+	}
+
+	// An identity from before clustering was tracked has no component, and the
+	// controller must treat that as "unknown" rather than "false".
+	if _, ok := identityClusterMode("3.126.0|clickhouse-db=langfuse"); ok {
+		t.Error("a pre-clustering identity should report no recorded mode")
+	}
+}
+
+// The ClickHouse target is fixed once a schema exists: another database would
+// leave the existing rows behind, and a table's engine cannot change after
+// CREATE. Only the version may move in place — that is the upgrade path.
+func TestRetargetedComponents(t *testing.T) {
+	cases := []struct {
+		name             string
+		applied, desired string
+		wantChanged      int
+	}{
+		{
+			name:        "plain version upgrade is allowed",
+			applied:     testIdentity("3.100.0", "langfuse", true),
+			desired:     testIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+		{
+			name:        "never migrated — anything goes",
+			applied:     "",
+			desired:     testIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+		{
+			name:        "database retargeted",
+			applied:     testIdentity("3.126.0", "old", false),
+			desired:     testIdentity("3.126.0", "new", false),
+			wantChanged: 1,
+		},
+		{
+			name:        "clustering flipped",
+			applied:     testIdentity("3.126.0", "langfuse", false),
+			desired:     testIdentity("3.126.0", "langfuse", true),
+			wantChanged: 1,
+		},
+		{
+			// Previously allowed as an escape hatch. Both changing at once is
+			// still a retarget, and belongs on a separate instance.
+			name:        "both at once",
+			applied:     testIdentity("3.126.0", "langfuse", false),
+			desired:     testIdentity("3.126.0", "langfuse_clustered", true),
+			wantChanged: 2,
+		},
+		{
+			// Recorded before clustering was tracked: nothing to compare it to,
+			// so only the database is checked.
+			name:        "identity predating clustering",
+			applied:     "3.126.0|clickhouse-db=langfuse",
+			desired:     testIdentity("3.126.0", "langfuse", true),
+			wantChanged: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := retargetedComponents(tc.applied, tc.desired)
+			if len(changed) != tc.wantChanged {
+				t.Errorf("changed = %v (%d), want %d", changed, len(changed), tc.wantChanged)
+			}
+		})
+	}
+}
+
+// Repointing a datastore reference moves the workload onto a different store
+// while the version is unchanged, so the identity has to notice — otherwise
+// migrations are skipped and the pods roll onto a schema that does not exist.
+func TestMigrationIdentity_CoversDatastoreReferences(t *testing.T) {
+	base := func() *v1alpha1.LangfuseInstance {
+		return &v1alpha1.LangfuseInstance{
+			Spec: v1alpha1.LangfuseInstanceSpec{
+				Image: v1alpha1.ImageSpec{Tag: "3.126.0"},
+				Database: &v1alpha1.DatabaseSpec{
+					External: &v1alpha1.ExternalDatabaseSpec{
+						SecretRef: v1alpha1.SecretKeysRef{Name: "pg-a"},
+					},
+				},
+				ClickHouse: &v1alpha1.ClickHouseSpec{
+					External: &v1alpha1.ExternalClickHouseSpec{
+						SecretRef: v1alpha1.SecretKeysRef{Name: "ch-a"},
+					},
+				},
+			},
+		}
+	}
+
+	applied := migrationIdentity(base())
+
+	t.Run("postgres secret repointed", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Database.External.SecretRef.Name = "pg-b"
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.database")
+	})
+
+	t.Run("clickhouse secret repointed", func(t *testing.T) {
+		instance := base()
+		instance.Spec.ClickHouse.External.SecretRef.Name = "ch-b"
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.clickhouse (connection)")
+	})
+
+	t.Run("switched from external to cnpg postgres", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Database = &v1alpha1.DatabaseSpec{
+			CloudNativePG: &v1alpha1.CloudNativePGSpec{
+				ClusterRef: v1alpha1.ObjectReference{Name: "pg-a"},
+			},
+		}
+		// Same name, different kind of reference — still a different datastore.
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.database")
+	})
+
+	t.Run("unchanged references are not a retarget", func(t *testing.T) {
+		if changed := retargetedComponents(applied, migrationIdentity(base())); len(changed) != 0 {
+			t.Errorf("changed = %v, want none", changed)
+		}
+	})
+
+	t.Run("version upgrade alone is not a retarget", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Image.Tag = "3.200.0"
+		if changed := retargetedComponents(applied, migrationIdentity(instance)); len(changed) != 0 {
+			t.Errorf("changed = %v, want none", changed)
+		}
+		if migrationUpToDate(applied, migrationIdentity(instance)) {
+			t.Error("a version upgrade should still reopen the gate")
+		}
+	})
+}
+
+func assertRetargeted(t *testing.T, applied, desired, wantField string) {
+	t.Helper()
+	changed := retargetedComponents(applied, desired)
+	if len(changed) != 1 {
+		t.Fatalf("changed = %v, want exactly one entry", changed)
+	}
+	if !strings.HasPrefix(changed[0], wantField) {
+		t.Errorf("changed = %q, want it to name %q", changed[0], wantField)
+	}
+}
+
+// The database is the last component so a name containing the separator still
+// round-trips, and the marker prefixes must not be confused with each other.
+func TestIdentityDatabase(t *testing.T) {
+	for _, database := range []string{"default", "langfuse", "db-clickhouse-cluster=x", "odd|name", "with=equals"} {
+		identity := testIdentity("3.126.0", database, true)
+
+		got, ok := identityDatabase(identity)
+		if !ok || got != database {
+			t.Errorf("identityDatabase(%q) = %q (found=%v), want %q", identity, got, ok, database)
+		}
+		if mode, ok := identityClusterMode(identity); !ok || mode != "true" {
+			t.Errorf("cluster mode for database %q = %q (found=%v), want true", database, mode, ok)
+		}
+	}
+
+	if _, ok := identityDatabase("3.126.0|clickhouse-cluster=true"); ok {
+		t.Error("an identity with no database component should report none")
+	}
+}
+
+// Instances migrated by an operator that forced CLICKHOUSE_CLUSTER_ENABLED=false
+// really did run unclustered, so back-filling false is accurate — and enabling
+// clustering on them must therefore be detected as a switch.
+func TestAppliedMigrationIdentity_BackfillsUnclustered(t *testing.T) {
+	instance := &v1alpha1.LangfuseInstance{
+		Spec: v1alpha1.LangfuseInstanceSpec{
+			Image:      v1alpha1.ImageSpec{Tag: "3.126.0"},
+			ClickHouse: &v1alpha1.ClickHouseSpec{Cluster: &v1alpha1.ClickHouseClusterSpec{Enabled: true}},
+		},
+		Status: v1alpha1.LangfuseInstanceStatus{
+			Database: &v1alpha1.DatabaseStatus{MigrationVersion: "3.126.0"},
+		},
+	}
+
+	was, ok := identityClusterMode(appliedMigrationIdentity(instance))
+	if !ok || was != "false" {
+		t.Fatalf("back-filled mode = %q (found=%v), want false", was, ok)
+	}
+	want, _ := identityClusterMode(migrationIdentity(instance))
+	if want != "true" {
+		t.Fatalf("desired mode = %q, want true", want)
+	}
+	if was == want {
+		t.Error("enabling clustering on a legacy instance must register as a switch")
+	}
+}
+
+// The operator's own ClickHouse queries must target whatever database the
+// workload uses, or schema-drift detection reports phantom drift by looking in
+// the wrong place.
+func TestClickHouseDatabase(t *testing.T) {
+	cases := []struct {
+		name     string
+		instance *v1alpha1.LangfuseInstance
+		want     string
+	}{
+		{"no clickhouse block", &v1alpha1.LangfuseInstance{}, "default"},
+		{
+			name: "unset falls back to Langfuse's own default",
+			instance: &v1alpha1.LangfuseInstance{Spec: v1alpha1.LangfuseInstanceSpec{
+				ClickHouse: &v1alpha1.ClickHouseSpec{},
+			}},
+			want: "default",
+		},
+		{
+			name: "explicit database is honoured",
+			instance: &v1alpha1.LangfuseInstance{Spec: v1alpha1.LangfuseInstanceSpec{
+				ClickHouse: &v1alpha1.ClickHouseSpec{Database: "langfuse"},
+			}},
+			want: "langfuse",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clickHouseDatabase(tc.instance); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// up.sh exits 1 without CLICKHOUSE_MIGRATION_URL, CLICKHOUSE_USER or
+// CLICKHOUSE_PASSWORD, and the operator only emits those for keys present in
+// the spec — so a Job built without them can never succeed.
+func TestMissingClickHouseMigrationKeys(t *testing.T) {
+	external := func(keys map[string]string) *v1alpha1.LangfuseInstance {
+		return &v1alpha1.LangfuseInstance{
+			Spec: v1alpha1.LangfuseInstanceSpec{
+				ClickHouse: &v1alpha1.ClickHouseSpec{
+					External: &v1alpha1.ExternalClickHouseSpec{
+						SecretRef: v1alpha1.SecretKeysRef{Name: "ch", Keys: keys},
+					},
+				},
+			},
+		}
+	}
+
+	cases := []struct {
+		name     string
+		instance *v1alpha1.LangfuseInstance
+		want     []string
+	}{
+		{
+			name:     "url only — the common mistake",
+			instance: external(map[string]string{"url": "url"}),
+			want:     []string{"migrationUrl", "username", "password"},
+		},
+		{
+			name: "complete",
+			instance: external(map[string]string{
+				"url": "url", "migrationUrl": "migration_url",
+				"username": "user", "password": "pass",
+			}),
+			want: nil,
+		},
+		{
+			name:     "empty value counts as missing",
+			instance: external(map[string]string{"url": "url", "migrationUrl": "", "username": "u", "password": "p"}),
+			want:     []string{"migrationUrl"},
+		},
+		{
+			name:     "no clickhouse configured",
+			instance: &v1alpha1.LangfuseInstance{},
+			want:     nil,
+		},
+		{
+			name: "managed mode derives all three itself",
+			instance: &v1alpha1.LangfuseInstance{
+				Spec: v1alpha1.LangfuseInstanceSpec{
+					ClickHouse: &v1alpha1.ClickHouseSpec{Managed: &v1alpha1.ManagedClickHouseSpec{}},
+				},
+			},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := missingClickHouseMigrationKeys(tc.instance)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got %v, want %v", got, tc.want)
+					break
+				}
+			}
+		})
+	}
+}

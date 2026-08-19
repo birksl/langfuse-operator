@@ -56,6 +56,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `RedisReady` | Redis is connected |
 | `BlobStorageReady` | Blob storage is accessible |
 | `MigrationsComplete` | All migrations have finished |
+| `DatastoreTargetUnchanged` | Present and `False` only while the spec points at datastores the schema was not migrated into, which freezes reconciliation; removed otherwise. See [Changing the datastore target](#changing-the-datastore-target) |
 | `SecretsReady` | All secrets are generated/available |
 | `ClickHouseRetentionApplied` | TTL policies are active |
 | `ClickHouseSchemaDrift` | Schema drift detected |
@@ -135,6 +136,41 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `encryption` | *ClickHouseEncryptionSpec | Encryption settings |
 | `retention` | *RetentionSpec | Data retention policies |
 | `schemaDrift` | *SchemaDriftSpec | Schema drift detection |
+| `database` | string | ClickHouse database (`CLICKHOUSE_DB`), also used by schema-drift detection and retention. Defaults to `default`. **The database must already exist** — no Langfuse migration creates it, and neither does the operator. Never put it in the connection URL. Fixed once migrations have succeeded; see [Changing the datastore target](#changing-the-datastore-target). |
+| `cluster` | *ClickHouseClusterSpec | Replicated (clustered) ClickHouse — see below |
+
+### ClickHouseClusterSpec
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Use Langfuse's clustered migrations (`ReplicatedReplacingMergeTree` tables with `ON CLUSTER` DDL) and `clusterAllReplicas` at query time. |
+
+Only for `external` ClickHouse that is a genuine replicated cluster with Keeper — for example one deployed by the Altinity ClickHouse operator. It is rejected for `managed`, which is a single node. Leave it off for a single-node endpoint or ClickHouse Cloud; upstream's own `docker-compose` defaults it off, even though Langfuse's env schema defaults it on.
+
+Two constraints worth knowing before you enable it:
+
+- **Your cluster must be named `default`.** Langfuse's clustered migrations hardcode `ON CLUSTER default` and golang-migrate does not template SQL, so any other cluster name requires hand-written migrations. The operator deliberately exposes no cluster-name field rather than one that only half works.
+- **It cannot be changed after migrations have run.** ClickHouse fixes a table's engine at `CREATE` time, so switching would need every table rebuilt via `INSERT SELECT`. The operator refuses the change and reports it on `MigrationsComplete` rather than starting a migration that would fail against the existing tables.
+
+Both `cluster.enabled` and `database` are part of the instance's datastore target, described below.
+
+### Changing the datastore target
+
+The operator treats the datastores an instance was migrated into as fixed. Only the image tag moves in place — that is the upgrade path. The target is:
+
+| Part of the target | Not part of the target |
+|---|---|
+| `database.external.secretRef.name`, or the CNPG `clusterRef.name` | The values behind any key — rotate credentials freely |
+| The `url` and `directUrl` key names under `database.external.secretRef.keys` | The `username`/`password` key names |
+| `clickhouse.external.secretRef.name`, or `managed` | `image.tag` — upgrading is the normal path |
+| The `url` and `migrationUrl` key names under `clickhouse.external.secretRef.keys` | |
+| `clickhouse.database` and `clickhouse.cluster.enabled` | |
+
+Endpoint key names count because a Secret can hold several endpoints, so the Secret name alone does not identify a datastore. `directUrl` counts as much as `url`: Langfuse's Prisma datasource declares `directUrl = env("DIRECT_URL")` and `prisma migrate deploy` prefers it when set, so it is where the schema actually lands.
+
+Change any of them after a successful migration and the operator sets `DatastoreTargetUnchanged` to `False`, reports `Error`, and stops reconciling every child resource before it touches one — the running pods keep the configuration they were migrated for. `status.version` and `status.publicUrl` keep describing what is actually deployed rather than the edited spec. Reverting the spec clears the condition and reconciliation resumes.
+
+To move an instance to different datastores, create a **separate `LangfuseInstance`** for the new target and cut over once it has migrated. The old instance keeps serving the old data until you remove it, which an in-place edit would not: re-pointing at another database leaves every row already written behind, invisible to the application, with nothing to warn you.
 
 ### RedisSpec
 
@@ -295,7 +331,7 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 
 | Field | Type | Description |
 |---|---|---|
-| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (required, `postgres://…`), `directUrl` (optional, bypasses pooling). With a `tls` block the `url` must **not** contain a query string. |
+| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (required, `postgres://…`), `directUrl` (optional, bypasses pooling — Prisma runs migrations through it when set). With a `tls` block the `url` must **not** contain a query string. Percent-encode reserved characters in the password: a literal `@` must be `%40`.<br><br>The Secret name and the `url`/`directUrl` key names are part of the instance's datastore target, so changing them is refused once a schema exists — see [Changing the datastore target](#changing-the-datastore-target). Credential keys and the values behind any key are not: rotate freely. |
 | `tls` | [`DatabaseTLSSpec`](#databasetlsspec) | TLS for the PostgreSQL connection. |
 
 ### MigrationSpec
@@ -340,7 +376,7 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 
 | Field | Type | Description |
 |---|---|---|
-| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (HTTP, e.g. `http://ch:8123`), `migrationUrl` (native, e.g. `clickhouse://ch:9000`), `username`, `password`. With a `tls` block, use the TLS scheme/port (`https://…:8443`, `clickhouse://…:9440`). |
+| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (HTTP, e.g. `http://ch:8123`), `migrationUrl` (native, e.g. `clickhouse://ch:9000`), `username`, `password`. With a `tls` block, use the TLS scheme/port (`https://…:8443`, `clickhouse://…:9440`).<br><br>`migrationUrl`, `username` and `password` are **required**: the migration Job exits non-zero without them. The `url` must be an origin — never put a database or path in it, as ClickHouse's HTTP interface selects the database by parameter, not path. Use `clickhouse.database` instead.<br><br>The Secret name and the `url`/`migrationUrl` key names are part of the instance's datastore target; see [Changing the datastore target](#changing-the-datastore-target). |
 | `tls` | [`ClickHouseTLSSpec`](#clickhousetlsspec) | TLS for the ClickHouse connection. |
 
 ### ClickHouseEncryptionSpec

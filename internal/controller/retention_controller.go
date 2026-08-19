@@ -97,7 +97,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 	retention := instance.Spec.ClickHouse.Retention
 
 	// 3. Build and apply the ALTER TABLE TTL statements for each configured table
-	statements := r.buildRetentionStatements(retention)
+	statements := r.buildRetentionStatements(instance, retention)
 	if len(statements) > 0 {
 		if instance.Status.ClickHouse == nil {
 			instance.Status.ClickHouse = &v1alpha1.ClickHouseStatus{}
@@ -107,7 +107,7 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 		// RetentionApplied reflects what ClickHouse actually accepted. It was
 		// previously set to true purely from computing the statements, so the CR
 		// claimed retention was active while data was retained forever.
-		instance.Status.ClickHouse.RetentionApplied = err == nil
+		instance.Status.ClickHouse.RetentionApplied = ptrTo(err == nil)
 
 		switch {
 		case err != nil:
@@ -152,8 +152,30 @@ func (r *RetentionController) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{RequeueAfter: retentionRequeueInterval}, nil
 }
 
-// buildRetentionStatements generates ALTER TABLE TTL statements from the retention spec.
-func (r *RetentionController) buildRetentionStatements(retention *v1alpha1.RetentionSpec) []string {
+// buildRetentionStatements generates ALTER TABLE TTL statements from the
+// retention spec.
+//
+// On a clustered instance the statements carry ON CLUSTER. ALTER on a
+// Replicated*MergeTree table does propagate to the other replicas of its shard
+// through Keeper, so a single-shard cluster would be fine without it — but shards
+// are independent, and a plain ALTER against one endpoint would leave every other
+// shard on the old TTL while status reported the policy applied. The operator
+// cannot see the topology, so it always distributes when clustering is on.
+func (r *RetentionController) buildRetentionStatements(instance *v1alpha1.LangfuseInstance, retention *v1alpha1.RetentionSpec) []string {
+	// The cluster name is fixed: Langfuse's clustered migrations hardcode
+	// `ON CLUSTER default`, so the tables only exist on a cluster of that name.
+	onCluster := ""
+	if instance.Spec.ClickHouse.ClusterEnabled() {
+		onCluster = " ON CLUSTER " + langfuseClickHouseClusterName
+	}
+	return buildRetentionStatementsFor(retention, onCluster)
+}
+
+// langfuseClickHouseClusterName is the only cluster name Langfuse's clustered
+// migrations work against. See ClickHouseClusterSpec.Enabled.
+const langfuseClickHouseClusterName = "default"
+
+func buildRetentionStatementsFor(retention *v1alpha1.RetentionSpec, onCluster string) []string {
 	tableTTLs := map[string]int32{}
 	if retention.Traces != nil && retention.Traces.TTLDays > 0 {
 		tableTTLs["traces"] = retention.Traces.TTLDays
@@ -172,8 +194,8 @@ func (r *RetentionController) buildRetentionStatements(retention *v1alpha1.Reten
 			continue
 		}
 		stmt := fmt.Sprintf(
-			"ALTER TABLE %s MODIFY TTL %s + INTERVAL %d DAY",
-			table.Table, table.TimestampColumn, ttlDays,
+			"ALTER TABLE %s%s MODIFY TTL %s + INTERVAL %d DAY",
+			table.Table, onCluster, table.TimestampColumn, ttlDays,
 		)
 		statements = append(statements, stmt)
 	}

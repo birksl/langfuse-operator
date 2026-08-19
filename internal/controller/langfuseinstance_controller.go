@@ -60,6 +60,10 @@ const (
 	// removal, so users find out from the CR rather than from a failed upgrade.
 	conditionTypeDeprecated = "Deprecated"
 
+	// conditionTypeDatastoreTarget reports that the spec points at a datastore
+	// the current schema does not live in, so workload reconciliation is held.
+	conditionTypeDatastoreTarget = "DatastoreTargetUnchanged"
+
 	// fieldOwnerInstance identifies this controller in managedFields. Sibling
 	// controllers must use a different owner, or server-side apply prunes the
 	// fields they set but this one does not declare.
@@ -118,6 +122,30 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if instance.Status.Phase == "" {
 		instance.Status.Phase = phasePending
 	}
+
+	// 2b. Stop before touching any child resource if the datastore target has
+	// moved since the last successful migration. The migration controller refuses
+	// such a change, but its return only stops itself — this controller would
+	// still build config from the new spec and roll Web/Worker onto a target that
+	// has no schema. Freezing the workload where it is keeps the instance serving
+	// until the spec is reverted, or the new target is given its own instance.
+	if changed := retargetedComponents(appliedMigrationIdentity(instance), migrationIdentity(instance)); len(changed) > 0 {
+		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:   conditionTypeDatastoreTarget,
+			Status: metav1.ConditionFalse,
+			Reason: "TargetChangedAfterMigration",
+			Message: fmt.Sprintf("Not reconciling workloads: %s changed after migrations ran. "+
+				"Revert the change, or create a separate LangfuseInstance for the new target",
+				strings.Join(changed, " and ")),
+			ObservedGeneration: instance.Generation,
+		})
+		if statusErr := r.updateStatus(ctx, instance, original, false); statusErr != nil {
+			log.Error(statusErr, "failed to update status")
+		}
+		log.Error(nil, "refusing to reconcile workloads onto a retargeted datastore", "changed", changed)
+		return ctrl.Result{}, nil
+	}
+	meta.RemoveStatusCondition(&instance.Status.Conditions, conditionTypeDatastoreTarget)
 
 	// 3. Build env var config
 	config, err := langfuse.BuildConfig(instance)
@@ -187,7 +215,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// 14. Update status
-	if err := r.updateStatus(ctx, instance, original); err != nil {
+	if err := r.updateStatus(ctx, instance, original, true); err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
@@ -278,7 +306,10 @@ func (r *LangfuseInstanceReconciler) apply(ctx context.Context, instance *v1alph
 	return nil
 }
 
-func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance, original *v1alpha1.LangfuseInstance) error {
+// updateStatus refreshes observed state and derives phase. workloadApplied says
+// whether this pass actually reconciled the Deployments; when it did not, fields
+// that describe what is running are left as they were.
+func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance, original *v1alpha1.LangfuseInstance, workloadApplied bool) error {
 	// Fetch current deployment states
 	webDeploy := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: resources.WebName(instance), Namespace: instance.Namespace}, webDeploy); err != nil {
@@ -312,8 +343,14 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance,
 
 	instance.Status.Phase, instance.Status.Ready = derivePhase(instance)
 
-	instance.Status.Version = instance.Spec.Image.Tag
-	instance.Status.PublicUrl = instance.Spec.Auth.NextAuthUrl
+	// Only advance these once the spec has actually been applied to the
+	// Deployments. On a frozen reconcile the pods still run the previous image and
+	// URL, so publishing the spec's values would claim a rollout that never
+	// happened — and with migrations disabled it would claim it indefinitely.
+	if workloadApplied {
+		instance.Status.Version = instance.Spec.Image.Tag
+		instance.Status.PublicUrl = instance.Spec.Auth.NextAuthUrl
+	}
 
 	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 		Type:               conditionTypeReady,

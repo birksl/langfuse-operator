@@ -119,7 +119,7 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 		})
 
 	case len(missing) > 0:
-		instance.Status.ClickHouse.SchemaDrift = true
+		instance.Status.ClickHouse.SchemaDrift = ptrTo(true)
 		// autoRepair is deliberately not acted on: recreating Langfuse's tables
 		// belongs to its own migrations, and a wrong DDL here would corrupt the
 		// schema. Missing tables almost always mean migrations have not run.
@@ -132,18 +132,18 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 			Status: metav1.ConditionFalse,
 			Reason: "TablesMissing",
 			Message: fmt.Sprintf("Expected Langfuse tables missing from ClickHouse database %q: %s.%s",
-				defaultClickHouseDatabase, strings.Join(missing, ", "), repairNote),
+				clickHouseDatabase(instance), strings.Join(missing, ", "), repairNote),
 			ObservedGeneration: instance.Generation,
 		})
 
 	default:
-		instance.Status.ClickHouse.SchemaDrift = false
+		instance.Status.ClickHouse.SchemaDrift = ptrTo(false)
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 			Type:   "SchemaDriftChecked",
 			Status: metav1.ConditionTrue,
 			Reason: "NoDriftDetected",
 			Message: fmt.Sprintf("All %d expected Langfuse tables present in database %q (next check in %dm)",
-				len(expectedClickHouseTables), defaultClickHouseDatabase, checkInterval),
+				len(expectedClickHouseTables), clickHouseDatabase(instance), checkInterval),
 			ObservedGeneration: instance.Generation,
 		})
 	}
@@ -179,7 +179,7 @@ func (r *SchemaDriftController) findMissingTables(ctx context.Context, instance 
 	}
 
 	rows, err := ch.queryRows(ctx, fmt.Sprintf(
-		"SELECT name FROM system.tables WHERE database = '%s'", defaultClickHouseDatabase))
+		"SELECT name FROM system.tables WHERE database = '%s'", clickHouseDatabase(instance)))
 	if err != nil {
 		return nil, err
 	}

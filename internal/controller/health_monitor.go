@@ -135,7 +135,7 @@ func (r *HealthMonitorReconciler) checkDatabase(ctx context.Context, instance *v
 	if instance.Status.Database == nil {
 		instance.Status.Database = &v1alpha1.DatabaseStatus{}
 	}
-	instance.Status.Database.Connected = res.Connected
+	instance.Status.Database.Connected = ptrTo(res.Connected)
 	return conditionFromProbe(conditionDatabaseReady, res, instance.Generation)
 }
 
@@ -146,7 +146,7 @@ func (r *HealthMonitorReconciler) checkClickHouse(ctx context.Context, instance 
 	if instance.Status.ClickHouse == nil {
 		instance.Status.ClickHouse = &v1alpha1.ClickHouseStatus{}
 	}
-	instance.Status.ClickHouse.Connected = res.Connected
+	instance.Status.ClickHouse.Connected = ptrTo(res.Connected)
 	return conditionFromProbe(conditionClickHouseReady, res, instance.Generation)
 }
 
@@ -157,7 +157,7 @@ func (r *HealthMonitorReconciler) checkRedis(ctx context.Context, instance *v1al
 	if instance.Status.Redis == nil {
 		instance.Status.Redis = &v1alpha1.ConnectionStatus{}
 	}
-	instance.Status.Redis.Connected = res.Connected
+	instance.Status.Redis.Connected = ptrTo(res.Connected)
 	return conditionFromProbe(conditionRedisReady, res, instance.Generation)
 }
 
@@ -178,7 +178,7 @@ func (r *HealthMonitorReconciler) checkBlobStorage(ctx context.Context, instance
 	if instance.Status.BlobStorage == nil {
 		instance.Status.BlobStorage = &v1alpha1.BlobStorageStatus{}
 	}
-	instance.Status.BlobStorage.Connected = res.Connected
+	instance.Status.BlobStorage.Connected = ptrTo(res.Connected)
 	instance.Status.BlobStorage.Provider = instance.Spec.BlobStorage.Provider
 	return conditionFromProbe(conditionBlobStorageReady, res, instance.Generation)
 }
