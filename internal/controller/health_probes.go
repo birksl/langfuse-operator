@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,22 +87,41 @@ func resolveDatabaseEndpoint(ctx context.Context, c client.Client, instance *v1a
 }
 
 // parsePostgresURL extracts host and port from a postgres:// or postgresql:// URL.
+//
+// It deliberately does not use net/url: that rejects a bare '@' in the userinfo
+// per RFC 3986, but Prisma and the migration Job's init container both split on
+// the last '@', so a password containing one connects fine. Failing here would
+// report a healthy instance as unreachable.
 func parsePostgresURL(raw string) (string, string, error) {
-	if !strings.HasPrefix(raw, "postgres://") && !strings.HasPrefix(raw, "postgresql://") {
-		// Tolerate URLs missing the scheme by re-prefixing.
-		raw = "postgres://" + raw
+	rest := strings.TrimSpace(raw)
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
 	}
-	u, err := url.Parse(raw)
+
+	// Authority only — a '@' in the path or query is not a credential.
+	authority := rest
+	if i := strings.IndexAny(authority, "/?"); i >= 0 {
+		authority = authority[:i]
+	}
+	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		authority = authority[i+1:]
+	}
+	if authority == "" {
+		return "", "", errors.New("postgres URL has no host")
+	}
+
+	host, port, err := net.SplitHostPort(authority)
 	if err != nil {
-		return "", "", fmt.Errorf("parse postgres URL: %w", err)
+		host, port = strings.Trim(authority, "[]"), "5432"
 	}
-	host := u.Hostname()
 	if host == "" {
 		return "", "", errors.New("postgres URL has no host")
 	}
-	port := u.Port()
-	if port == "" {
-		port = "5432"
+	// A non-numeric port means the authority was mis-split — most often an
+	// unencoded '/' in the password, which no parser can recover. Say so rather
+	// than dialling nonsense and reporting the instance unreachable.
+	if _, err := strconv.Atoi(port); err != nil {
+		return "", "", fmt.Errorf("invalid port %q — percent-encode any /, @, :, #, ? or %% in the credentials", port)
 	}
 	return host, port, nil
 }
@@ -116,16 +136,47 @@ func probeClickHouse(ctx context.Context, c client.Client, instance *v1alpha1.La
 		return probeResult{Reason: "ConfigError", Message: fmt.Sprintf("Cannot resolve ClickHouse URL: %v", err)}
 	}
 
+	// Probe the origin, not the configured string: a URL carrying a path or
+	// query would make /ping 404 and report Unreachable, which reads as a
+	// network problem rather than the misconfiguration it is.
+	origin, err := clickHouseOrigin(endpoint)
+	if err != nil {
+		return probeResult{Reason: "ConfigError", Message: fmt.Sprintf("Invalid ClickHouse URL: %v", err)}
+	}
+
 	// An HTTPS endpoint secured by a private CA would fail x509 verification
 	// against the system trust store, so trust the instance's configured CA.
 	var tlsConfig *tls.Config
-	if strings.HasPrefix(endpoint, "https://") {
+	if strings.HasPrefix(origin, "https://") {
 		tlsConfig, err = instanceTLSConfig(ctx, c, instance)
 		if err != nil {
 			return probeResult{Reason: "ConfigError", Message: fmt.Sprintf("Cannot build ClickHouse TLS config: %v", err)}
 		}
 	}
-	return httpProbeTLS(ctx, endpoint+"/ping", "ClickHouse", tlsConfig)
+	return httpProbeTLS(ctx, origin+"/ping", "ClickHouse", tlsConfig)
+}
+
+// clickHouseOrigin reduces a configured ClickHouse URL to scheme://host:port,
+// rejecting one that carries a path or query string. ClickHouse's HTTP
+// interface selects a database with the CLICKHOUSE_DB env var (or a ?database=
+// parameter), never a path segment — so a path breaks every application query
+// too, not just this probe, and is worth reporting as a config error.
+func clickHouseOrigin(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse URL: %w", err)
+	}
+	if u.Host == "" {
+		return "", errors.New("no host")
+	}
+	if path := strings.Trim(u.Path, "/"); path != "" {
+		return "", fmt.Errorf("must not contain a path (got %q) — "+
+			"select the database with CLICKHOUSE_DB, not a URL path", u.Path)
+	}
+	if u.RawQuery != "" {
+		return "", fmt.Errorf("must not contain a query string (got %q)", u.RawQuery)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 func resolveClickHouseURL(ctx context.Context, c client.Client, instance *v1alpha1.LangfuseInstance) (string, error) {

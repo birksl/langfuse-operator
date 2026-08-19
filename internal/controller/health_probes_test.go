@@ -65,6 +65,29 @@ func TestParsePostgresURL(t *testing.T) {
 		{"no-port", "postgres://u:p@db/x", "db", "5432", false},
 		{"only-host", "postgres://db", "db", "5432", false},
 		{"empty", "", "", "", true},
+
+		// net/url rejects a bare '@' in userinfo, but Prisma and the migration
+		// Job's init container both split on the last '@', so these connect
+		// fine — reporting them unreachable marks a healthy instance Degraded.
+		{"unencoded @ in password", "postgresql://langfuse:secret@here@db-01-rw.database.svc/langfuse",
+			"db-01-rw.database.svc", "5432", false},
+		{"unencoded @ with port", "postgres://u:p@ss@db:6543/x", "db", "6543", false},
+		{"percent-encoded @ still works", "postgres://u:p%40ss@db:5432/x", "db", "5432", false},
+		{"colon in password", "postgres://u:p:ass@db:5432/x", "db", "5432", false},
+		{"hash in password", "postgres://u:p#ass@db/x", "db", "5432", false},
+
+		// An unencoded '/' in a password is not recoverable — it is
+		// indistinguishable from the start of the path, in any parser. Langfuse's
+		// own entrypoint tells users to percent-encode it for the same reason.
+		{"unencoded slash in password is rejected, not mis-parsed", "postgres://u:p/ass@db/x", "", "", true},
+
+		// A '@' after the authority belongs to the path or query, not the
+		// credentials, so it must not be mistaken for a separator.
+		{"@ in path only", "postgres://db:5432/tenant@a", "db", "5432", false},
+		{"@ in query only", "postgres://db/x?opts=a@b", "db", "5432", false},
+
+		{"ipv6 with port", "postgres://u:p@[fd00::1]:5432/x", "fd00::1", "5432", false},
+		{"ipv6 without port", "postgres://u:p@[fd00::1]/x", "fd00::1", "5432", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,6 +103,50 @@ func TestParsePostgresURL(t *testing.T) {
 			}
 			if host != tc.host || port != tc.port {
 				t.Fatalf("got host=%q port=%q, want host=%q port=%q", host, port, tc.host, tc.port)
+			}
+		})
+	}
+}
+
+// ─── clickHouseOrigin ───────────────────────────────────────────────────────
+
+func TestClickHouseOrigin(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+		wantErr        bool
+		errContains    string
+	}{
+		{name: "plain", in: "http://ch:8123", want: "http://ch:8123"},
+		{name: "trailing slash is harmless", in: "http://ch:8123/", want: "http://ch:8123"},
+		{name: "https", in: "https://ch.example.com:8443", want: "https://ch.example.com:8443"},
+		{name: "no port", in: "http://ch", want: "http://ch"},
+
+		// The reported failure: a database name in the path made /ping 404, which
+		// the probe reported as Unreachable — indistinguishable from a network
+		// outage. It must name the misconfiguration instead.
+		{name: "database in path", in: "http://ch:8123/langfuse",
+			wantErr: true, errContains: "must not contain a path"},
+		{name: "database as query", in: "http://ch:8123/?database=langfuse",
+			wantErr: true, errContains: "must not contain a query"},
+		{name: "no host", in: "not-a-url", wantErr: true, errContains: "no host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := clickHouseOrigin(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got origin %q", got)
+				}
+				if !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error %q should mention %q", err, tc.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
 	}
