@@ -85,7 +85,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	// CLICKHOUSE_DB, and that database needs its tables.
 	desiredTag := instance.Spec.Image.Tag
 	desiredIdentity := migrationIdentity(instance)
-	if applied := appliedMigrationIdentity(instance); applied == desiredIdentity {
+	if migrationUpToDate(appliedMigrationIdentity(instance), desiredIdentity) {
 		// Nothing to migrate, check if an existing Job needs cleanup
 		return r.cleanupCompletedJobs(ctx, instance)
 	}
@@ -187,9 +187,23 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 	// idempotent (prisma migrate deploy and golang-migrate both track what they
 	// have applied), so replacing an unrecognised Job is safe.
 	if jobIdentity := existingJob.Annotations[migrationIdentityAnnotation]; jobIdentity != desiredIdentity {
+		// Already terminating: wait rather than issue a second delete. Foreground
+		// deletion keeps the Job visible until its pods are gone, so this is how
+		// the drain is observed.
+		if !existingJob.DeletionTimestamp.IsZero() {
+			log.V(1).Info("waiting for the previous migration job to drain", "job", jobName)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
 		log.Info("replacing migration job from a different target",
 			"jobIdentity", jobIdentity, "desiredIdentity", desiredIdentity)
-		propagation := metav1.DeletePropagationBackground
+		// Foreground, not background: background deletion removes the Job object
+		// immediately and reaps its pods afterwards, so the replacement Job could
+		// start while the previous migration pod is still running. Two concurrent
+		// migration pods is exactly the Prisma advisory-lock contention the
+		// operator avoids by disabling migrations in the web and worker
+		// entrypoints. Foreground keeps the Job until its pods are gone.
+		propagation := metav1.DeletePropagationForeground
 		if err := r.Delete(ctx, existingJob, &client.DeleteOptions{
 			PropagationPolicy: &propagation,
 		}); err != nil && !apierrors.IsNotFound(err) {
@@ -336,15 +350,64 @@ const migrationIdentityAnnotation = "langfuse.palena.ai/migration-identity"
 // spec.clickhouse.database, or clear status.migration.appliedIdentity, to force
 // them.
 func migrationIdentity(instance *v1alpha1.LangfuseInstance) string {
-	return buildMigrationIdentity(instance.Spec.Image.Tag, clickHouseDatabase(instance),
-		instance.Spec.ClickHouse.ClusterEnabled())
+	return buildMigrationIdentity(migrationTarget{
+		version:         instance.Spec.Image.Tag,
+		postgresRef:     postgresRefName(instance),
+		clickHouseRef:   clickHouseRefName(instance),
+		clickHouseDB:    clickHouseDatabase(instance),
+		clickHouseClust: instance.Spec.ClickHouse.ClusterEnabled(),
+	})
 }
 
-func buildMigrationIdentity(version, database string, clustered bool) string {
-	return fmt.Sprintf("%s|%s%t|%s%s",
-		langfuse.NormalizeVersion(version),
-		migrationIdentityClusterKey, clustered,
-		migrationIdentityDatabaseKey, database)
+// migrationTarget is everything spec-visible that decides what a migration
+// produces and where it lands.
+type migrationTarget struct {
+	version         string
+	postgresRef     string
+	clickHouseRef   string
+	clickHouseDB    string
+	clickHouseClust bool
+}
+
+// buildMigrationIdentity renders a target. The database goes last because a
+// ClickHouse database name may contain the separator; the reference names cannot,
+// being Kubernetes object names.
+func buildMigrationIdentity(t migrationTarget) string {
+	return fmt.Sprintf("%s|%s%s|%s%s|%s%t|%s%s",
+		langfuse.NormalizeVersion(t.version),
+		migrationIdentityPostgresRefKey, t.postgresRef,
+		migrationIdentityClickHouseRefKey, t.clickHouseRef,
+		migrationIdentityClusterKey, t.clickHouseClust,
+		migrationIdentityDatabaseKey, t.clickHouseDB)
+}
+
+// postgresRefName names the Secret or CNPG Cluster the schema lives behind.
+// Only the reference is used, never its contents: reading the Secret would make
+// a rotated credential look like a new datastore.
+func postgresRefName(instance *v1alpha1.LangfuseInstance) string {
+	db := instance.Spec.Database
+	switch {
+	case db == nil:
+		return ""
+	case db.CloudNativePG != nil:
+		return "cnpg/" + db.CloudNativePG.ClusterRef.Name
+	case db.External != nil:
+		return "secret/" + db.External.SecretRef.Name
+	}
+	return ""
+}
+
+func clickHouseRefName(instance *v1alpha1.LangfuseInstance) string {
+	ch := instance.Spec.ClickHouse
+	switch {
+	case ch == nil:
+		return ""
+	case ch.Managed != nil:
+		return "managed"
+	case ch.External != nil:
+		return "secret/" + ch.External.SecretRef.Name
+	}
+	return ""
 }
 
 const (
@@ -352,20 +415,71 @@ const (
 	// cannot be re-migrated into, so it has to be recoverable from a recorded
 	// identity.
 	migrationIdentityClusterKey = "clickhouse-cluster="
-	// migrationIdentityDatabaseKey prefixes the database component, which
-	// decides whether a clustering change has somewhere empty to land. It comes
-	// last so a database name containing the separator still round-trips.
+	// migrationIdentityPostgresRefKey and migrationIdentityClickHouseRefKey
+	// prefix the datastore references. Repointing either moves the workload onto
+	// a different store, which is a retarget rather than an upgrade.
+	migrationIdentityPostgresRefKey   = "postgres-ref="
+	migrationIdentityClickHouseRefKey = "clickhouse-ref="
+	// migrationIdentityDatabaseKey prefixes the database component. It comes last
+	// so a database name containing the separator still round-trips.
 	migrationIdentityDatabaseKey = "clickhouse-db="
 )
 
-// identityClusterMode extracts the clustering component of a recorded identity.
-func identityClusterMode(identity string) (string, bool) {
+// migrationUpToDate reports whether a recorded identity already covers the
+// desired target.
+//
+// It compares component by component rather than as a string, because a recorded
+// identity may predate a component: those written before the datastore references
+// were tracked carry only version, clustering and database. Whole-string equality
+// would make every such instance look stale and re-migrate on an operator
+// upgrade, and would do so again the next time a component is added.
+func migrationUpToDate(applied, desired string) bool {
+	if applied == "" {
+		return false
+	}
+	if identityVersion(applied) != identityVersion(desired) {
+		return false
+	}
+	for _, key := range []string{
+		migrationIdentityPostgresRefKey,
+		migrationIdentityClickHouseRefKey,
+		migrationIdentityClusterKey,
+	} {
+		was, ok := identityComponent(applied, key)
+		if !ok {
+			continue
+		}
+		if want, _ := identityComponent(desired, key); was != want {
+			return false
+		}
+	}
+	if was, ok := identityDatabase(applied); ok {
+		if want, _ := identityDatabase(desired); was != want {
+			return false
+		}
+	}
+	return true
+}
+
+// identityVersion returns the leading, unprefixed version component.
+func identityVersion(identity string) string {
+	version, _, _ := strings.Cut(identity, "|")
+	return version
+}
+
+// identityComponent extracts a prefixed component of a recorded identity.
+func identityComponent(identity, key string) (string, bool) {
 	for _, part := range strings.Split(identity, "|") {
-		if mode, ok := strings.CutPrefix(part, migrationIdentityClusterKey); ok {
-			return mode, true
+		if value, ok := strings.CutPrefix(part, key); ok {
+			return value, true
 		}
 	}
 	return "", false
+}
+
+// identityClusterMode extracts the clustering component of a recorded identity.
+func identityClusterMode(identity string) (string, bool) {
+	return identityComponent(identity, migrationIdentityClusterKey)
 }
 
 // retargetedComponents lists which parts of the datastore target differ from
@@ -381,17 +495,30 @@ func retargetedComponents(applied, desired string) []string {
 		return nil // never migrated; anything goes
 	}
 
+	// Each component is compared only when the recorded identity carries it, so
+	// identities written before a component existed do not read as a retarget.
 	var changed []string
-	if was, ok := identityDatabase(applied); ok {
-		if want, _ := identityDatabase(desired); was != want {
-			changed = append(changed, fmt.Sprintf("spec.clickhouse.database %q -> %q", was, want))
+	for _, c := range []struct {
+		field  string
+		key    string
+		lookup func(string) (string, bool)
+	}{
+		{"spec.database", migrationIdentityPostgresRefKey, nil},
+		{"spec.clickhouse (connection)", migrationIdentityClickHouseRefKey, nil},
+		{"spec.clickhouse.cluster.enabled", migrationIdentityClusterKey, nil},
+		{"spec.clickhouse.database", "", identityDatabase},
+	} {
+		lookup := c.lookup
+		if lookup == nil {
+			key := c.key
+			lookup = func(identity string) (string, bool) { return identityComponent(identity, key) }
 		}
-	}
-	// Absent on identities recorded before clustering was tracked, in which case
-	// there is nothing to compare against.
-	if was, ok := identityClusterMode(applied); ok {
-		if want, _ := identityClusterMode(desired); was != want {
-			changed = append(changed, fmt.Sprintf("spec.clickhouse.cluster.enabled %s -> %s", was, want))
+		was, ok := lookup(applied)
+		if !ok {
+			continue
+		}
+		if want, _ := lookup(desired); was != want {
+			changed = append(changed, fmt.Sprintf("%s %q -> %q", c.field, was, want))
 		}
 	}
 	return changed
@@ -415,10 +542,16 @@ func appliedMigrationIdentity(instance *v1alpha1.LangfuseInstance) string {
 		return instance.Status.Migration.AppliedIdentity
 	}
 	if instance.Status.Database != nil && instance.Status.Database.MigrationVersion != "" {
-		// Those operators forced CLICKHOUSE_CLUSTER_ENABLED=false, so the
-		// back-filled identity is accurate: they ran unclustered.
-		return buildMigrationIdentity(instance.Status.Database.MigrationVersion,
-			defaultClickHouseDatabase, false)
+		// Record only what those operators actually determined: the version, the
+		// "default" database they had no way to change, and unclustered, which
+		// they forced. The datastore references are deliberately absent — they
+		// were never recorded, and an absent component is skipped by
+		// retargetedComponents rather than read as a change. The reference checks
+		// therefore start applying after this instance's next real migration.
+		return fmt.Sprintf("%s|%s%t|%s%s",
+			langfuse.NormalizeVersion(instance.Status.Database.MigrationVersion),
+			migrationIdentityClusterKey, false,
+			migrationIdentityDatabaseKey, defaultClickHouseDatabase)
 	}
 	return ""
 }

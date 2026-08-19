@@ -11,12 +11,12 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
-	"github.com/PalenaAI/langfuse-operator/internal/langfuse"
 )
 
 // The gate must read the version this controller migrated, not the one the
@@ -53,12 +53,8 @@ func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
 				instance.Status.Database = &v1alpha1.DatabaseStatus{MigrationVersion: tc.migratedVersion}
 			}
 
-			// Mirrors the gate in Reconcile.
-			current := ""
-			if instance.Status.Database != nil {
-				current = instance.Status.Database.MigrationVersion
-			}
-			shouldMigrate := langfuse.VersionChanged(instance.Spec.Image.Tag, current) || current == ""
+			shouldMigrate := !migrationUpToDate(
+				appliedMigrationIdentity(instance), migrationIdentity(instance))
 
 			if shouldMigrate != tc.wantShouldMigrate {
 				t.Errorf("shouldMigrate = %v, want %v (deployed=%q migrated=%q tag=%q)",
@@ -66,6 +62,16 @@ func TestMigrationGate_UsesMigratedVersionNotDeployedVersion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// testIdentity builds an identity varying only the components most tests care
+// about, leaving the datastore references empty and therefore equal.
+func testIdentity(version, database string, clustered bool) string {
+	return buildMigrationIdentity(migrationTarget{
+		version:         version,
+		clickHouseDB:    database,
+		clickHouseClust: clustered,
+	})
 }
 
 // The gate must reopen when the migration target changes, not only the tag —
@@ -98,17 +104,17 @@ func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
 	}{
 		{
 			name:              "same tag and database — nothing to do",
-			instance:          withStatus("3.126.0", buildMigrationIdentity("3.126.0", "langfuse", false), "", "langfuse"),
+			instance:          withStatus("3.126.0", testIdentity("3.126.0", "langfuse", false), "", "langfuse"),
 			wantShouldMigrate: false,
 		},
 		{
 			name:              "database retargeted on an unchanged tag",
-			instance:          withStatus("3.126.0", buildMigrationIdentity("3.126.0", "old", false), "", "new"),
+			instance:          withStatus("3.126.0", testIdentity("3.126.0", "old", false), "", "new"),
 			wantShouldMigrate: true,
 		},
 		{
 			name:              "tag upgraded on an unchanged database",
-			instance:          withStatus("3.126.0", buildMigrationIdentity("3.100.0", "langfuse", false), "", "langfuse"),
+			instance:          withStatus("3.126.0", testIdentity("3.100.0", "langfuse", false), "", "langfuse"),
 			wantShouldMigrate: true,
 		},
 		{
@@ -132,7 +138,8 @@ func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			shouldMigrate := appliedMigrationIdentity(tc.instance) != migrationIdentity(tc.instance)
+			shouldMigrate := !migrationUpToDate(
+				appliedMigrationIdentity(tc.instance), migrationIdentity(tc.instance))
 			if shouldMigrate != tc.wantShouldMigrate {
 				t.Errorf("shouldMigrate = %v, want %v (applied=%q desired=%q)",
 					shouldMigrate, tc.wantShouldMigrate,
@@ -154,12 +161,12 @@ func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
 	}
 	desired := migrationIdentity(instance)
 
-	previousVersion := buildMigrationIdentity("3.100.0", "langfuse", false)
+	previousVersion := testIdentity("3.100.0", "langfuse", false)
 	if previousVersion == desired {
 		t.Error("a Job from the previous version must not match the desired identity")
 	}
 
-	otherDatabase := buildMigrationIdentity("3.126.0", "other", false)
+	otherDatabase := testIdentity("3.126.0", "other", false)
 	if otherDatabase == desired {
 		t.Error("a Job for another database must not match the desired identity")
 	}
@@ -171,7 +178,7 @@ func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
 	}
 
 	// The v-prefix is normalised away, so v3.126.0 and 3.126.0 are one target.
-	if got := buildMigrationIdentity("v3.126.0", "langfuse", false); got != desired {
+	if got := testIdentity("v3.126.0", "langfuse", false); got != desired {
 		t.Errorf("normalised identity = %q, want %q", got, desired)
 	}
 }
@@ -180,8 +187,8 @@ func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
 // from a recorded identity — that is how the controller tells a switch it cannot
 // perform from a re-migration it can.
 func TestIdentityClusterMode(t *testing.T) {
-	clustered := buildMigrationIdentity("3.126.0", "langfuse", true)
-	unclustered := buildMigrationIdentity("3.126.0", "langfuse", false)
+	clustered := testIdentity("3.126.0", "langfuse", true)
+	unclustered := testIdentity("3.126.0", "langfuse", false)
 
 	if clustered == unclustered {
 		t.Fatal("clustered and unclustered identities must differ")
@@ -197,7 +204,7 @@ func TestIdentityClusterMode(t *testing.T) {
 	}
 
 	// A database name containing the separator must not confuse extraction.
-	if mode, _ := identityClusterMode(buildMigrationIdentity("3.126.0", "db-clickhouse-cluster=x", true)); mode != "true" {
+	if mode, _ := identityClusterMode(testIdentity("3.126.0", "db-clickhouse-cluster=x", true)); mode != "true" {
 		t.Errorf("mode = %q, want true", mode)
 	}
 
@@ -219,34 +226,34 @@ func TestRetargetedComponents(t *testing.T) {
 	}{
 		{
 			name:        "plain version upgrade is allowed",
-			applied:     buildMigrationIdentity("3.100.0", "langfuse", true),
-			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			applied:     testIdentity("3.100.0", "langfuse", true),
+			desired:     testIdentity("3.126.0", "langfuse", true),
 			wantChanged: 0,
 		},
 		{
 			name:        "never migrated — anything goes",
 			applied:     "",
-			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			desired:     testIdentity("3.126.0", "langfuse", true),
 			wantChanged: 0,
 		},
 		{
 			name:        "database retargeted",
-			applied:     buildMigrationIdentity("3.126.0", "old", false),
-			desired:     buildMigrationIdentity("3.126.0", "new", false),
+			applied:     testIdentity("3.126.0", "old", false),
+			desired:     testIdentity("3.126.0", "new", false),
 			wantChanged: 1,
 		},
 		{
 			name:        "clustering flipped",
-			applied:     buildMigrationIdentity("3.126.0", "langfuse", false),
-			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			applied:     testIdentity("3.126.0", "langfuse", false),
+			desired:     testIdentity("3.126.0", "langfuse", true),
 			wantChanged: 1,
 		},
 		{
 			// Previously allowed as an escape hatch. Both changing at once is
 			// still a retarget, and belongs on a separate instance.
 			name:        "both at once",
-			applied:     buildMigrationIdentity("3.126.0", "langfuse", false),
-			desired:     buildMigrationIdentity("3.126.0", "langfuse_clustered", true),
+			applied:     testIdentity("3.126.0", "langfuse", false),
+			desired:     testIdentity("3.126.0", "langfuse_clustered", true),
 			wantChanged: 2,
 		},
 		{
@@ -254,7 +261,7 @@ func TestRetargetedComponents(t *testing.T) {
 			// so only the database is checked.
 			name:        "identity predating clustering",
 			applied:     "3.126.0|clickhouse-db=langfuse",
-			desired:     buildMigrationIdentity("3.126.0", "langfuse", true),
+			desired:     testIdentity("3.126.0", "langfuse", true),
 			wantChanged: 0,
 		},
 	}
@@ -269,11 +276,87 @@ func TestRetargetedComponents(t *testing.T) {
 	}
 }
 
+// Repointing a datastore reference moves the workload onto a different store
+// while the version is unchanged, so the identity has to notice — otherwise
+// migrations are skipped and the pods roll onto a schema that does not exist.
+func TestMigrationIdentity_CoversDatastoreReferences(t *testing.T) {
+	base := func() *v1alpha1.LangfuseInstance {
+		return &v1alpha1.LangfuseInstance{
+			Spec: v1alpha1.LangfuseInstanceSpec{
+				Image: v1alpha1.ImageSpec{Tag: "3.126.0"},
+				Database: &v1alpha1.DatabaseSpec{
+					External: &v1alpha1.ExternalDatabaseSpec{
+						SecretRef: v1alpha1.SecretKeysRef{Name: "pg-a"},
+					},
+				},
+				ClickHouse: &v1alpha1.ClickHouseSpec{
+					External: &v1alpha1.ExternalClickHouseSpec{
+						SecretRef: v1alpha1.SecretKeysRef{Name: "ch-a"},
+					},
+				},
+			},
+		}
+	}
+
+	applied := migrationIdentity(base())
+
+	t.Run("postgres secret repointed", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Database.External.SecretRef.Name = "pg-b"
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.database")
+	})
+
+	t.Run("clickhouse secret repointed", func(t *testing.T) {
+		instance := base()
+		instance.Spec.ClickHouse.External.SecretRef.Name = "ch-b"
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.clickhouse (connection)")
+	})
+
+	t.Run("switched from external to cnpg postgres", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Database = &v1alpha1.DatabaseSpec{
+			CloudNativePG: &v1alpha1.CloudNativePGSpec{
+				ClusterRef: v1alpha1.ObjectReference{Name: "pg-a"},
+			},
+		}
+		// Same name, different kind of reference — still a different datastore.
+		assertRetargeted(t, applied, migrationIdentity(instance), "spec.database")
+	})
+
+	t.Run("unchanged references are not a retarget", func(t *testing.T) {
+		if changed := retargetedComponents(applied, migrationIdentity(base())); len(changed) != 0 {
+			t.Errorf("changed = %v, want none", changed)
+		}
+	})
+
+	t.Run("version upgrade alone is not a retarget", func(t *testing.T) {
+		instance := base()
+		instance.Spec.Image.Tag = "3.200.0"
+		if changed := retargetedComponents(applied, migrationIdentity(instance)); len(changed) != 0 {
+			t.Errorf("changed = %v, want none", changed)
+		}
+		if migrationUpToDate(applied, migrationIdentity(instance)) {
+			t.Error("a version upgrade should still reopen the gate")
+		}
+	})
+}
+
+func assertRetargeted(t *testing.T, applied, desired, wantField string) {
+	t.Helper()
+	changed := retargetedComponents(applied, desired)
+	if len(changed) != 1 {
+		t.Fatalf("changed = %v, want exactly one entry", changed)
+	}
+	if !strings.HasPrefix(changed[0], wantField) {
+		t.Errorf("changed = %q, want it to name %q", changed[0], wantField)
+	}
+}
+
 // The database is the last component so a name containing the separator still
 // round-trips, and the marker prefixes must not be confused with each other.
 func TestIdentityDatabase(t *testing.T) {
 	for _, database := range []string{"default", "langfuse", "db-clickhouse-cluster=x", "odd|name", "with=equals"} {
-		identity := buildMigrationIdentity("3.126.0", database, true)
+		identity := testIdentity("3.126.0", database, true)
 
 		got, ok := identityDatabase(identity)
 		if !ok || got != database {

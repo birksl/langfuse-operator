@@ -60,6 +60,10 @@ const (
 	// removal, so users find out from the CR rather than from a failed upgrade.
 	conditionTypeDeprecated = "Deprecated"
 
+	// conditionTypeDatastoreTarget reports that the spec points at a datastore
+	// the current schema does not live in, so workload reconciliation is held.
+	conditionTypeDatastoreTarget = "DatastoreTargetUnchanged"
+
 	// fieldOwnerInstance identifies this controller in managedFields. Sibling
 	// controllers must use a different owner, or server-side apply prunes the
 	// fields they set but this one does not declare.
@@ -118,6 +122,30 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if instance.Status.Phase == "" {
 		instance.Status.Phase = phasePending
 	}
+
+	// 2b. Stop before touching any child resource if the datastore target has
+	// moved since the last successful migration. The migration controller refuses
+	// such a change, but its return only stops itself — this controller would
+	// still build config from the new spec and roll Web/Worker onto a target that
+	// has no schema. Freezing the workload where it is keeps the instance serving
+	// until the spec is reverted, or the new target is given its own instance.
+	if changed := retargetedComponents(appliedMigrationIdentity(instance), migrationIdentity(instance)); len(changed) > 0 {
+		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:   conditionTypeDatastoreTarget,
+			Status: metav1.ConditionFalse,
+			Reason: "TargetChangedAfterMigration",
+			Message: fmt.Sprintf("Not reconciling workloads: %s changed after migrations ran. "+
+				"Revert the change, or create a separate LangfuseInstance for the new target",
+				strings.Join(changed, " and ")),
+			ObservedGeneration: instance.Generation,
+		})
+		if statusErr := r.updateStatus(ctx, instance, original); statusErr != nil {
+			log.Error(statusErr, "failed to update status")
+		}
+		log.Error(nil, "refusing to reconcile workloads onto a retargeted datastore", "changed", changed)
+		return ctrl.Result{}, nil
+	}
+	meta.RemoveStatusCondition(&instance.Status.Conditions, conditionTypeDatastoreTarget)
 
 	// 3. Build env var config
 	config, err := langfuse.BuildConfig(instance)
