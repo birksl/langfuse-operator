@@ -136,6 +136,20 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `retention` | *RetentionSpec | Data retention policies |
 | `schemaDrift` | *SchemaDriftSpec | Schema drift detection |
 | `database` | string | ClickHouse database (`CLICKHOUSE_DB`), also used by schema-drift detection and retention. Defaults to `default`. **The database must already exist** — no Langfuse migration creates it, and neither does the operator. Never put it in the connection URL. |
+| `cluster` | *ClickHouseClusterSpec | Replicated (clustered) ClickHouse — see below |
+
+### ClickHouseClusterSpec
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Use Langfuse's clustered migrations (`ReplicatedReplacingMergeTree` tables with `ON CLUSTER` DDL) and `clusterAllReplicas` at query time. |
+
+Only for `external` ClickHouse that is a genuine replicated cluster with Keeper — for example one deployed by the Altinity ClickHouse operator. It is rejected for `managed`, which is a single node. Leave it off for a single-node endpoint or ClickHouse Cloud; upstream's own `docker-compose` defaults it off, even though Langfuse's env schema defaults it on.
+
+Two constraints worth knowing before you enable it:
+
+- **Your cluster must be named `default`.** Langfuse's clustered migrations hardcode `ON CLUSTER default` and golang-migrate does not template SQL, so any other cluster name requires hand-written migrations. The operator deliberately exposes no cluster-name field rather than one that only half works.
+- **It cannot be changed after migrations have run.** ClickHouse fixes a table's engine at `CREATE` time, so switching would need every table rebuilt via `INSERT SELECT`. The operator refuses the change and reports it on `MigrationsComplete` instead of starting a migration that would fail. To move an existing instance, migrate the data into a new database by hand and point `clickhouse.database` at it.
 
 ### RedisSpec
 

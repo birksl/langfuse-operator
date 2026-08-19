@@ -544,6 +544,9 @@ type ClickHouseSpec struct {
 	// SchemaDrift configures schema drift detection.
 	// +optional
 	SchemaDrift *SchemaDriftSpec `json:"schemaDrift,omitempty"`
+	// Cluster configures replicated (clustered) ClickHouse.
+	// +optional
+	Cluster *ClickHouseClusterSpec `json:"cluster,omitempty"`
 	// Database is the ClickHouse database Langfuse reads and writes
 	// (CLICKHOUSE_DB), also used by schema-drift detection and retention.
 	//
@@ -557,6 +560,36 @@ type ClickHouseSpec struct {
 	// byte-identical and avoids a rollout on upgrade.
 	// +optional
 	Database string `json:"database,omitempty"`
+}
+
+// ClickHouseClusterSpec configures replicated (clustered) ClickHouse.
+type ClickHouseClusterSpec struct {
+	// Enabled selects Langfuse's clustered migrations, which create the tables
+	// as ReplicatedReplacingMergeTree with ON CLUSTER DDL, and makes the
+	// application read query_log through clusterAllReplicas.
+	//
+	// Only for external ClickHouse that really is a replicated cluster with
+	// Keeper. The managed mode is a single node and rejects this. Leave it off
+	// for a single-node endpoint or ClickHouse Cloud — upstream's own
+	// docker-compose defaults it off, even though the Langfuse env schema
+	// defaults it on.
+	//
+	// The cluster must be named "default": Langfuse's clustered migrations
+	// hardcode `ON CLUSTER default` and golang-migrate does not template SQL, so
+	// any other name needs a hand-written migration. The operator deliberately
+	// exposes no cluster-name field rather than one that only half works.
+	//
+	// This picks the table engine at CREATE time, so it cannot be changed once
+	// migrations have run — the clustered DDL would fail against existing
+	// tables, and converting them needs an INSERT SELECT by hand. The operator
+	// refuses the change rather than starting a migration that cannot succeed.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// ClusterEnabled reports whether clustered (replicated) ClickHouse is selected.
+func (s *ClickHouseSpec) ClusterEnabled() bool {
+	return s != nil && s.Cluster != nil && s.Cluster.Enabled
 }
 
 // ManagedClickHouseSpec deploys a managed ClickHouse instance.

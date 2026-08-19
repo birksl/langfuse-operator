@@ -95,17 +95,17 @@ func TestMigrationGate_ReopensWhenTheTargetChanges(t *testing.T) {
 	}{
 		{
 			name:              "same tag and database — nothing to do",
-			instance:          withStatus("3.126.0", "3.126.0|clickhouse-db=langfuse", "", "langfuse"),
+			instance:          withStatus("3.126.0", buildMigrationIdentity("3.126.0", "langfuse", false), "", "langfuse"),
 			wantShouldMigrate: false,
 		},
 		{
 			name:              "database retargeted on an unchanged tag",
-			instance:          withStatus("3.126.0", "3.126.0|clickhouse-db=old", "", "new"),
+			instance:          withStatus("3.126.0", buildMigrationIdentity("3.126.0", "old", false), "", "new"),
 			wantShouldMigrate: true,
 		},
 		{
 			name:              "tag upgraded on an unchanged database",
-			instance:          withStatus("3.126.0", "3.100.0|clickhouse-db=langfuse", "", "langfuse"),
+			instance:          withStatus("3.126.0", buildMigrationIdentity("3.100.0", "langfuse", false), "", "langfuse"),
 			wantShouldMigrate: true,
 		},
 		{
@@ -151,12 +151,12 @@ func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
 	}
 	desired := migrationIdentity(instance)
 
-	previousVersion := buildMigrationIdentity("3.100.0", "langfuse")
+	previousVersion := buildMigrationIdentity("3.100.0", "langfuse", false)
 	if previousVersion == desired {
 		t.Error("a Job from the previous version must not match the desired identity")
 	}
 
-	otherDatabase := buildMigrationIdentity("3.126.0", "other")
+	otherDatabase := buildMigrationIdentity("3.126.0", "other", false)
 	if otherDatabase == desired {
 		t.Error("a Job for another database must not match the desired identity")
 	}
@@ -168,8 +168,67 @@ func TestMigrationIdentity_DistinguishesStaleJobs(t *testing.T) {
 	}
 
 	// The v-prefix is normalised away, so v3.126.0 and 3.126.0 are one target.
-	if got := buildMigrationIdentity("v3.126.0", "langfuse"); got != desired {
+	if got := buildMigrationIdentity("v3.126.0", "langfuse", false); got != desired {
 		t.Errorf("normalised identity = %q, want %q", got, desired)
+	}
+}
+
+// Clustering fixes the table engine at CREATE time, so it must be recoverable
+// from a recorded identity — that is how the controller tells a switch it cannot
+// perform from a re-migration it can.
+func TestIdentityClusterMode(t *testing.T) {
+	clustered := buildMigrationIdentity("3.126.0", "langfuse", true)
+	unclustered := buildMigrationIdentity("3.126.0", "langfuse", false)
+
+	if clustered == unclustered {
+		t.Fatal("clustered and unclustered identities must differ")
+	}
+
+	mode, ok := identityClusterMode(clustered)
+	if !ok || mode != "true" {
+		t.Errorf("clustered mode = %q (found=%v), want true", mode, ok)
+	}
+	mode, ok = identityClusterMode(unclustered)
+	if !ok || mode != "false" {
+		t.Errorf("unclustered mode = %q (found=%v), want false", mode, ok)
+	}
+
+	// A database name containing the separator must not confuse extraction.
+	if mode, _ := identityClusterMode(buildMigrationIdentity("3.126.0", "db-clickhouse-cluster=x", true)); mode != "true" {
+		t.Errorf("mode = %q, want true", mode)
+	}
+
+	// An identity from before clustering was tracked has no component, and the
+	// controller must treat that as "unknown" rather than "false".
+	if _, ok := identityClusterMode("3.126.0|clickhouse-db=langfuse"); ok {
+		t.Error("a pre-clustering identity should report no recorded mode")
+	}
+}
+
+// Instances migrated by an operator that forced CLICKHOUSE_CLUSTER_ENABLED=false
+// really did run unclustered, so back-filling false is accurate — and enabling
+// clustering on them must therefore be detected as a switch.
+func TestAppliedMigrationIdentity_BackfillsUnclustered(t *testing.T) {
+	instance := &v1alpha1.LangfuseInstance{
+		Spec: v1alpha1.LangfuseInstanceSpec{
+			Image:      v1alpha1.ImageSpec{Tag: "3.126.0"},
+			ClickHouse: &v1alpha1.ClickHouseSpec{Cluster: &v1alpha1.ClickHouseClusterSpec{Enabled: true}},
+		},
+		Status: v1alpha1.LangfuseInstanceStatus{
+			Database: &v1alpha1.DatabaseStatus{MigrationVersion: "3.126.0"},
+		},
+	}
+
+	was, ok := identityClusterMode(appliedMigrationIdentity(instance))
+	if !ok || was != "false" {
+		t.Fatalf("back-filled mode = %q (found=%v), want false", was, ok)
+	}
+	want, _ := identityClusterMode(migrationIdentity(instance))
+	if want != "true" {
+		t.Fatalf("desired mode = %q, want true", want)
+	}
+	if was == want {
+		t.Error("enabling clustering on a legacy instance must register as a switch")
 	}
 }
 
