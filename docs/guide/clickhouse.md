@@ -74,13 +74,9 @@ Resource presets:
 
 ## Encryption
 
-```yaml
-spec:
-  clickhouse:
-    encryption:
-      enabled: true        # encryption at rest
-      blobStorage: false   # encrypt blob storage data
-```
+::: warning Accepted but not implemented
+`clickhouse.encryption` is not read by any controller — setting `enabled: true` encrypts nothing. Encryption at rest belongs to the storage layer: use an encrypted `storageClass` for a self-hosted cluster, or your provider's encryption for a managed one. Blob-storage encryption is configured on the bucket.
+:::
 
 ## Data Retention
 
@@ -100,15 +96,16 @@ spec:
         enabled: true
         warningThresholdPercent: 75
         criticalThresholdPercent: 90
-        pruneOldestPartitions: true
         minRetainDays: 7
 ```
 
-When storage pressure exceeds the critical threshold, the operator prunes the oldest partitions while respecting `minRetainDays`.
+TTLs are applied as `ALTER TABLE … MODIFY TTL`, which ClickHouse enforces during merges — expiring rows disappear over the following hours, not at the instant the TTL passes. The `RetentionConfigured` condition and `status.clickhouse.retentionApplied` reflect what ClickHouse actually accepted, so a failure there means the TTL is not in force whatever the spec says.
+
+Storage pressure is **reporting only**: crossing a threshold raises the `StoragePressure` condition and nothing else. `pruneOldestPartitions` is accepted by the API but not implemented — dropping partitions is irreversible data loss, so the operator leaves that call to a human, and `minRetainDays` will only matter once something prunes. The percentage is measured per node and taken from the fullest one; see [StoragePressureSpec](../reference/langfuseinstance.md#storagepressurespec).
 
 ## Schema Drift Detection
 
-The operator periodically validates the ClickHouse schema against what Langfuse expects:
+The operator periodically checks that the tables Langfuse's migrations create are present:
 
 ```yaml
 spec:
@@ -116,7 +113,13 @@ spec:
     schemaDrift:
       enabled: true
       checkIntervalMinutes: 60
-      autoRepair: false        # set to true to auto-fix drift
 ```
 
-When drift is detected, the operator sets a `ClickHouseSchemaDrift` status condition and emits an event. With `autoRepair: true`, it attempts to apply corrective DDL.
+The check is table-level — `traces`, `observations`, `scores`, `schema_migrations` — and deliberately not column-level: Langfuse owns its schema and changes it between versions, so an operator-side column manifest would report drift on every upgrade. Missing tables almost always mean migrations never ran, or ran against a different database.
+
+The result lands on the `SchemaDriftChecked` condition, whose polarity is worth noting: `True` means the check ran and found everything, `False` with reason `TablesMissing` means drift, and `Unknown` means the check could not reach ClickHouse.
+
+Two limitations to be aware of:
+
+- **`autoRepair` does nothing.** The field is accepted, but repairing means recreating Langfuse's own tables, and a wrong `CREATE TABLE` here would corrupt the schema for good. When drift is found with `autoRepair: true` the condition says so rather than pretending a repair happened.
+- **The check sees one node.** It reads `system.tables` from whichever node answers, so on a cluster it cannot tell you that a table is missing on *some* nodes. Storage pressure reads every node; this check does not yet.

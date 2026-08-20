@@ -21,7 +21,7 @@ features:
     details: Deploy Web, Worker, PostgreSQL, ClickHouse, Redis, and Blob Storage with a single custom resource.
   - icon: "\U0001F504"
     title: Automated Operations
-    details: Zero-downtime upgrades, automatic migrations, secret rotation, and circuit breakers out of the box.
+    details: Rolling upgrades, migration Jobs gated on what was actually migrated, pod restarts on secret rotation, and circuit breakers out of the box.
   - icon: "\U0001F465"
     title: Multi-Tenancy
     details: Manage organizations, projects, and API keys declaratively through Kubernetes CRDs.
@@ -30,7 +30,7 @@ features:
     details: Read-only root filesystem, non-root execution, NetworkPolicies, and automatic secret generation.
   - icon: "\U0001F4CA"
     title: Observability
-    details: Prometheus ServiceMonitor, OpenTelemetry integration, and operator-level metrics built in.
+    details: Every datastore probed and reported as status conditions, OpenTelemetry export from Langfuse itself, and controller-runtime metrics when enabled.
   - icon: "\U0001F30D"
     title: Platform Agnostic
     details: Works on vanilla Kubernetes, OpenShift, EKS, GKE, and AKS with native integrations.

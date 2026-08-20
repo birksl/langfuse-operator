@@ -47,7 +47,11 @@ The Secret should contain the full PostgreSQL connection string:
 postgresql://user:password@host:5432/langfuse?sslmode=require
 ```
 
-The optional `directUrl` key is used for operations that need to bypass connection poolers like PgBouncer (e.g., migrations).
+**Percent-encode reserved characters in the password** — a literal `@` must be `%40`. Prisma rejects an unencoded one, and an unencoded `/` also defeats the operator's own endpoint parsing.
+
+The optional `directUrl` key bypasses connection poolers like PgBouncer. Langfuse's Prisma datasource declares `directUrl = env("DIRECT_URL")` and `prisma migrate deploy` prefers it when set, so when you provide it, **that** is the endpoint migrations run against — the `url` only serves the application.
+
+For the same reason the Secret's name and the `url`/`directUrl` key names are part of the instance's datastore target, and changing them after migrations have run is refused. The values behind the keys are not, so credential rotation is free. See [Changing the datastore target](../reference/langfuseinstance.md#changing-the-datastore-target).
 
 ## Managed (deprecated)
 

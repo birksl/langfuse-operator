@@ -53,6 +53,17 @@ The chart defaults to the image tag matching its `appVersion` (e.g. `v0.10.0`). 
 
 See the [chart values](https://github.com/PalenaAI/langfuse-operator/blob/main/deploy/charts/langfuse-operator/values.yaml) for all configuration options (replicas, resources, tolerations, affinity, etc.).
 
+### Operator logging
+
+The operator binary is built with zap's development mode on, which on its own logs every health probe at debug level and encodes lines for human eyes. The chart overrides both:
+
+| Value | Default | Notes |
+|---|---|---|
+| `logLevel` | `info` | `debug`, `info`, `error`, or a zap verbosity integer. Set `debug` while diagnosing an instance — most of that volume is per-probe health and circuit-breaker lines |
+| `logFormat` | `json` | `json` or `console`. Anything else fails the render rather than reaching the pod |
+
+`console` is worth knowing about: development mode's own encoder prefixes each line with a tab-separated timestamp and level and renders only the *fields* as JSON, which is close enough to fool a log shipper expecting one object per line. Set an empty string for either value to leave the binary's built-in default alone.
+
 ### Namespace-Scoped Install
 
 By default the operator watches all namespaces. To restrict it to specific namespaces:

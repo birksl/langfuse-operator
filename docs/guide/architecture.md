@@ -53,12 +53,14 @@ Each auxiliary controller watches `LangfuseInstance` but focuses on a single con
 
 | Controller | Responsibility |
 |---|---|
-| **Migration** | Runs database migration Jobs on version changes |
-| **Health Monitor** | Periodic health checks, updates status conditions |
+| **Migration** | Runs migration Jobs when the version changes, and refuses a datastore target the existing schema does not live in |
+| **Health Monitor** | Periodic datastore probes and Deployment readiness, published as status conditions |
 | **Secret Controller** | Auto-generates secrets, detects rotation, triggers restarts |
-| **Retention** | Applies ClickHouse TTL policies, handles storage pressure |
-| **Schema Drift** | Validates ClickHouse schema, optionally auto-repairs |
+| **Retention** | Applies ClickHouse TTL policies and reports storage pressure |
+| **Schema Drift** | Checks that Langfuse's ClickHouse tables exist |
 | **Circuit Breaker** | Scales down workers when dependencies fail |
+
+`status.phase` and `status.ready` are derived in one place, from the conditions these controllers publish — no controller writes the phase directly. Two of them computing it from different inputs is what produced a `Pending`↔`Degraded` write loop that generated most of a cluster's operator log volume.
 
 ### Multi-Tenancy Controllers
 
