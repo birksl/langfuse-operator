@@ -153,6 +153,16 @@ func TestFindSchemaDrift(t *testing.T) {
 		}
 	})
 
+	t.Run("replicated engines everywhere is not drift", func(t *testing.T) {
+		schemas := []nodeSchema{
+			{node: "ch-0", engines: enginesFor("ReplicatedReplacingMergeTree", all...)},
+			{node: "ch-1", engines: enginesFor("ReplicatedReplacingMergeTree", all...)},
+		}
+		if !findSchemaDrift(schemas, true).empty() {
+			t.Error("a correctly clustered schema must not report drift")
+		}
+	})
+
 	t.Run("engines are only judged when clustering is on", func(t *testing.T) {
 		// A single-node instance is supposed to have plain engines.
 		schemas := []nodeSchema{{node: "ch-0", engines: enginesFor("ReplacingMergeTree", all...)}}

@@ -156,10 +156,25 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("building config for migration: %w", err)
 	}
 
+	return r.reconcileMigrationJob(ctx, instance, original, config, desiredTag, desiredIdentity)
+}
+
+// reconcileMigrationJob creates, replaces or reports on the migration Job.
+// Split out of Reconcile purely for legibility: the gate above decides whether
+// a migration should run at all, this decides what to do about the Job that
+// does or does not exist.
+func (r *MigrationController) reconcileMigrationJob(
+	ctx context.Context,
+	instance, original *v1alpha1.LangfuseInstance,
+	config *langfuse.Config,
+	desiredTag, desiredIdentity string,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	// Check for existing migration job
 	jobName := resources.MigrationJobName(instance)
 	existingJob := &batchv1.Job{}
-	err = r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: instance.Namespace}, existingJob)
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: instance.Namespace}, existingJob)
 
 	if apierrors.IsNotFound(err) {
 		// Create migration job

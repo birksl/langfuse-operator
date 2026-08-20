@@ -576,7 +576,9 @@ func newChurnNamespace(name string) string {
 
 // newChurnInstance builds a minimal-but-valid LangfuseInstance whose three
 // datastores all resolve to a closed port.
-func newChurnInstance(namespace, name string) *v1alpha1.LangfuseInstance {
+// newChurnInstance builds the fixture every churn spec reconciles against.
+func newChurnInstance(namespace string) *v1alpha1.LangfuseInstance {
+	const name = "churn"
 	secretRef := func(keys map[string]string) v1alpha1.SecretKeysRef {
 		return v1alpha1.SecretKeysRef{Name: churnEndpointSecret, Keys: keys}
 	}
@@ -671,7 +673,7 @@ var _ = Describe("Reconcile churn", func() {
 				},
 			)
 
-			instance := newChurnInstance(ns, name)
+			instance := newChurnInstance(ns)
 			Expect(k8sClient.Create(context.Background(), instance)).To(Succeed())
 
 			key := types.NamespacedName{Name: name, Namespace: ns}
@@ -711,7 +713,7 @@ var _ = Describe("Reconcile churn", func() {
 				}).SetupWithManager(mgr)
 			})
 
-			instance := newChurnInstance(ns, name)
+			instance := newChurnInstance(ns)
 			Expect(k8sClient.Create(context.Background(), instance)).To(Succeed())
 
 			key := types.NamespacedName{Name: name, Namespace: ns}
@@ -765,7 +767,7 @@ var _ = Describe("Reconcile churn", func() {
 				}).SetupWithManager(mgr)
 			})
 
-			instance := newChurnInstance(ns, name)
+			instance := newChurnInstance(ns)
 			Expect(k8sClient.Create(context.Background(), instance)).To(Succeed())
 
 			webName := resources.WebName(instance)
@@ -821,7 +823,7 @@ var _ = Describe("Reconcile churn", func() {
 				}).SetupWithManager(mgr)
 			})
 
-			instance := newChurnInstance(ns, name)
+			instance := newChurnInstance(ns)
 			instance.Spec.Web.Autoscaling = &v1alpha1.AutoscalingSpec{
 				Enabled:              true,
 				MinReplicas:          ptr.To(int32(1)),
@@ -891,7 +893,7 @@ var _ = Describe("Reconcile churn", func() {
 				},
 			)
 
-			instance := newChurnInstance(ns, name)
+			instance := newChurnInstance(ns)
 			instance.Spec.Worker.Replicas = ptr.To(int32(2))
 			instance.Spec.CircuitBreaker = &v1alpha1.CircuitBreakerSpec{
 				Enabled: ptr.To(true),
