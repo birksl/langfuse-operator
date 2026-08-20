@@ -652,16 +652,20 @@ A pod-level failure surfaced into `status.web.issues`, `status.worker.issues`, o
 
 | Field | Type | Description |
 |---|---|---|
-| `serviceMonitor` | [`*ServiceMonitorSpec`](#servicemonitorspec) | Prometheus ServiceMonitor |
+| `serviceMonitor` | [`*ServiceMonitorSpec`](#servicemonitorspec) | Deprecated and ignored; removal in 0.11.0 |
 | `otel` | [`*OTELSpec`](#otelspec) | OpenTelemetry integration |
 
 ### ServiceMonitorSpec
 
+::: danger Ignored since 0.10.0, removed in 0.11.0
+Langfuse serves no Prometheus endpoint, so the ServiceMonitor this created could only name the web pod's `/api/public/health` — a JSON route Prometheus cannot parse, leaving a target permanently reported down. Setting any field below raises the `Deprecated` condition and creates nothing, and the operator deletes the ServiceMonitor an earlier version created. Use [`otel`](#otelspec); see [Observability](../guide/observability.md#servicemonitor-removed).
+:::
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Create a Prometheus ServiceMonitor |
-| `interval` | string | `30s` | Scrape interval |
-| `labels` | map[string]string | | Additional ServiceMonitor labels |
+| `enabled` | bool | `false` | Ignored |
+| `interval` | string | `30s` | Ignored |
+| `labels` | map[string]string | | Ignored |
 
 ### OTELSpec
 

@@ -17,66 +17,13 @@ limitations under the License.
 package resources
 
 import (
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
 	v1alpha1 "github.com/PalenaAI/langfuse-operator/api/v1alpha1"
 )
 
-// ServiceMonitorName returns the name for the Prometheus ServiceMonitor resource.
+// ServiceMonitorName returns the name of the ServiceMonitor earlier versions
+// created for an instance's web component. Nothing builds one any more —
+// Langfuse serves no Prometheus endpoint — but the name is still needed to
+// remove the ones already out there. See removeRetiredServiceMonitor.
 func ServiceMonitorName(instance *v1alpha1.LangfuseInstance) string {
 	return instance.Name + "-web"
-}
-
-// BuildServiceMonitor constructs a Prometheus ServiceMonitor as an unstructured object.
-// This avoids importing the prometheus-operator API types as a dependency.
-func BuildServiceMonitor(instance *v1alpha1.LangfuseInstance) *unstructured.Unstructured {
-	labels := CommonLabels(instance, "web")
-
-	// Merge additional labels from the ServiceMonitor spec.
-	if instance.Spec.Observability != nil &&
-		instance.Spec.Observability.ServiceMonitor != nil &&
-		instance.Spec.Observability.ServiceMonitor.Labels != nil {
-		for k, v := range instance.Spec.Observability.ServiceMonitor.Labels {
-			labels[k] = v
-		}
-	}
-
-	// Determine scrape interval, defaulting to "30s".
-	interval := "30s"
-	if instance.Spec.Observability != nil &&
-		instance.Spec.Observability.ServiceMonitor != nil &&
-		instance.Spec.Observability.ServiceMonitor.Interval != "" {
-		interval = instance.Spec.Observability.ServiceMonitor.Interval
-	}
-
-	// Selector labels match the web component pods.
-	selectorLabels := map[string]interface{}{
-		"app.kubernetes.io/name":      "langfuse",
-		"app.kubernetes.io/instance":  instance.Name,
-		"app.kubernetes.io/component": "web",
-	}
-
-	return &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "monitoring.coreos.com/v1",
-			"kind":       "ServiceMonitor",
-			"metadata": map[string]interface{}{
-				"name":      ServiceMonitorName(instance),
-				"namespace": instance.Namespace,
-				"labels":    toStringInterfaceMap(labels),
-			},
-			"spec": map[string]interface{}{
-				"selector": map[string]interface{}{
-					"matchLabels": selectorLabels,
-				},
-				"endpoints": []interface{}{
-					map[string]interface{}{
-						"port":     "http",
-						"path":     "/api/public/health",
-						"interval": interval,
-					},
-				},
-			},
-		},
-	}
 }

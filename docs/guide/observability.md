@@ -20,27 +20,15 @@ What you get is controller-runtime's standard set, which is what actually matter
 | `rest_client_requests_total` | Counter | API-server calls by verb, code and host — the cost side of a busy loop |
 | `go_*`, `process_*` | — | Standard Go runtime and process metrics |
 
-::: warning `langfuse_operator_*` and `langfuse_instance_*` do not work
-Four `langfuse_operator_*` series (`reconcile_total`, `reconcile_errors_total`, `reconcile_duration_seconds`, `managed_instances`) are registered but never recorded, so they export nothing beyond a zero gauge. The `langfuse_instance_*` series described in older docs — replica counts, queue depth, ClickHouse storage, circuit-breaker state — were never implemented at all. Read those values from `status` instead; the operator keeps them there.
-:::
+There are no `langfuse_operator_*` or `langfuse_instance_*` series. Four `langfuse_operator_*` metrics were registered but never recorded by any controller, so they only ever exported an empty counter and a zero gauge; they have been removed rather than left as a trap. The `langfuse_instance_*` series described in older docs — replica counts, queue depth, ClickHouse storage, circuit-breaker state — were never implemented at all. Read those from `status`, where the operator does keep them.
 
-## ServiceMonitor
+## ServiceMonitor (removed)
 
-```yaml
-spec:
-  observability:
-    serviceMonitor:
-      enabled: true
-      interval: "30s"
-      labels:
-        release: prometheus       # match your Prometheus selector
-```
+`spec.observability.serviceMonitor` is deprecated, ignored, and goes away in 0.11.0.
 
-This creates a `monitoring.coreos.com/v1` ServiceMonitor selecting the instance's **web** pods, scraping port `http` at `/api/public/health` on the configured interval.
+Langfuse OSS serves no Prometheus endpoint, so the ServiceMonitor this used to create could only name the web pod's `/api/public/health` — a JSON route Prometheus cannot parse as the text exposition format. The result was a target permanently reported as down, which reads as an unreachable instance rather than as a misconfiguration.
 
-::: warning That is a health endpoint, not a metrics endpoint
-`/api/public/health` returns JSON. Prometheus cannot parse it as the text exposition format, so the target will report as down rather than yielding series. Langfuse OSS exposes no Prometheus endpoint — use OTEL below for Langfuse's own telemetry, and treat this ServiceMonitor as a liveness signal at best.
-:::
+Setting the field now raises the `Deprecated` condition and creates nothing. If an earlier version created one for the instance, the operator **deletes** it, so upgrading clears the stuck target on its own. Use OTEL below for Langfuse's own telemetry.
 
 ## OpenTelemetry
 

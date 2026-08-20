@@ -92,7 +92,8 @@ type LangfuseInstanceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
+// ServiceMonitors are only ever removed now, so delete is the only verb left.
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -257,8 +258,6 @@ func (r *LangfuseInstanceReconciler) reconcileNetworking(ctx context.Context, in
 }
 
 func (r *LangfuseInstanceReconciler) reconcilePlatform(ctx context.Context, instance *v1alpha1.LangfuseInstance) error {
-	log := logf.FromContext(ctx)
-
 	if err := r.reconcileHPAs(ctx, instance); err != nil {
 		return fmt.Errorf("reconciling HPAs: %w", err)
 	}
@@ -267,16 +266,45 @@ func (r *LangfuseInstanceReconciler) reconcilePlatform(ctx context.Context, inst
 		return fmt.Errorf("reconciling PDBs: %w", err)
 	}
 
-	if instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil &&
-		instance.Spec.Observability.ServiceMonitor.Enabled {
-		sm := resources.BuildServiceMonitor(instance)
-		if err := r.apply(ctx, instance, sm); err != nil {
-			return fmt.Errorf("reconciling servicemonitor: %w", err)
+	if instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil {
+		if err := r.removeRetiredServiceMonitor(ctx, instance); err != nil {
+			return fmt.Errorf("removing retired servicemonitor: %w", err)
 		}
-		log.Info("reconciled servicemonitor", "name", sm.GetName())
 	}
 
 	return nil
+}
+
+// removeRetiredServiceMonitor deletes the ServiceMonitor earlier versions
+// created for this instance.
+//
+// Langfuse serves no Prometheus endpoint, so the only thing that
+// ServiceMonitor could name was the web pod's /api/public/health — a JSON route
+// Prometheus cannot parse. The target reported down permanently, which is worse
+// than no target: it looks like the instance is unreachable. Rather than leave
+// that behind when the field was retired, remove it; setDeprecationCondition
+// tells the user why and points at spec.observability.otel.
+//
+// Absent Prometheus-operator CRDs are not an error — then there is nothing to
+// remove either.
+func (r *LangfuseInstanceReconciler) removeRetiredServiceMonitor(ctx context.Context, instance *v1alpha1.LangfuseInstance) error {
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+	})
+	sm.SetNamespace(instance.Namespace)
+	sm.SetName(resources.ServiceMonitorName(instance))
+
+	err := r.Delete(ctx, sm)
+	switch {
+	case err == nil:
+		logf.FromContext(ctx).Info("removed the retired web ServiceMonitor", "name", sm.GetName())
+		return nil
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return nil
+	default:
+		return err
+	}
 }
 
 // apply server-side applies desired, declaring only the fields the operator
@@ -373,10 +401,17 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance,
 func setDeprecationCondition(ctx context.Context, instance *v1alpha1.LangfuseInstance) {
 	var deprecated []string
 	if instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.Managed != nil {
-		deprecated = append(deprecated, "spec.clickhouse.managed (use external: ClickHouse Cloud or the Altinity operator)")
+		deprecated = append(deprecated, "spec.clickhouse.managed (single-node, no replication or backups, "+
+			"unsuitable for production — use external: ClickHouse Cloud or the Altinity operator)")
 	}
 	if instance.Spec.Redis != nil && instance.Spec.Redis.Managed != nil {
-		deprecated = append(deprecated, "spec.redis.managed (use external: a managed Redis service or a Redis operator)")
+		deprecated = append(deprecated, "spec.redis.managed (single-node, no replication or backups, "+
+			"unsuitable for production — use external: a managed Redis service or a Redis operator)")
+	}
+	if instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil {
+		deprecated = append(deprecated, "spec.observability.serviceMonitor (ignored: Langfuse serves no "+
+			"Prometheus endpoint, so the ServiceMonitor only ever pointed Prometheus at a JSON health "+
+			"route and reported the target down — use spec.observability.otel)")
 	}
 
 	if len(deprecated) == 0 {
@@ -384,8 +419,7 @@ func setDeprecationCondition(ctx context.Context, instance *v1alpha1.LangfuseIns
 		return
 	}
 
-	message := fmt.Sprintf("Deprecated fields in use, removal in 0.11.0: %s. "+
-		"These modes are single-node with no replication or backups and are unsuitable for production.",
+	message := fmt.Sprintf("Deprecated fields in use, removal in 0.11.0: %s",
 		strings.Join(deprecated, "; "))
 
 	logf.FromContext(ctx).Info("WARNING: deprecated spec fields in use", "fields", deprecated)
