@@ -103,17 +103,27 @@ A `ConfigError` on `DatabaseReady` or `ClickHouseReady` means the operator could
 not make sense of the connection string — it never got as far as dialling, so
 this is not a network problem. Two cases account for most of them:
 
-**Reserved characters in a PostgreSQL password.** A URL is not a place for raw
-`/`, `@`, `:`, `#`, `?` or `%`; percent-encode them (`@` becomes `%40`). An
-unencoded `/` mis-splits the authority and the probe says so rather than dialling
-nonsense:
+**A `/` or `?` in a PostgreSQL password.** Both end the URL's authority, so the
+host after them is invisible to every parser. The probe says so rather than
+dialling nonsense:
 
 ```
-invalid port "somepassword" — percent-encode any /, @, :, #, ? or % in the credentials
+invalid port "somepassword" — percent-encode '/' as %2F and '?' as %3F in the credentials; '@' and ':' need no encoding
 ```
 
-Langfuse's own Prisma client is stricter than the probe here, so encode
-regardless of whether the probe complains.
+**An `@` is not one of these cases.** Prisma takes the last `@` in the authority
+as the credential separator, and so do the migration Job's init container and
+this probe, so a password containing one connects normally. If you are looking at
+a `DatabaseReady` condition that reads `net/url: invalid userinfo`, that is the
+pre-0.10.0 probe — the operator is running an older image than you think. Check
+what is actually deployed:
+
+```bash
+kubectl get pod -n langfuse-operator-system -l control-plane=controller-manager -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'
+```
+
+A rebuilt image pushed under a tag that already exists on the node will not be
+pulled again unless the tag is new or `imagePullPolicy` is `Always`.
 
 **A path or query on the ClickHouse URL.** ClickHouse's HTTP interface picks a
 database from a parameter, never from a path segment, so `http://ch:8123/langfuse`

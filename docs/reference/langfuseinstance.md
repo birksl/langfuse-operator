@@ -347,7 +347,7 @@ Reachable only from the rejected `managed` mode above, so the operator takes no 
 
 | Field | Type | Description |
 |---|---|---|
-| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (required, `postgres://…`), `directUrl` (optional, bypasses pooling — Prisma runs migrations through it when set). With a `tls` block the `url` must **not** contain a query string. Percent-encode reserved characters in the password: a literal `@` must be `%40`.<br><br>The Secret name and the `url`/`directUrl` key names are part of the instance's datastore target, so changing them is refused once a schema exists — see [Changing the datastore target](#changing-the-datastore-target). Credential keys and the values behind any key are not: rotate freely. |
+| `secretRef` | SecretKeysRef | Reference to a Secret with connection details. Recognised keys: `url` (required, `postgres://…`), `directUrl` (optional, bypasses pooling — Prisma runs migrations through it when set). With a `tls` block the `url` must **not** contain a query string. Percent-encode `/` (`%2F`), `?` (`%3F`) and `#` (`%23`) in the password — each ends the URL's authority and hides the host. `@` and `:` need no encoding: Prisma, the migration Job and the operator's probe all split credentials at the last `@`.<br><br>The Secret name and the `url`/`directUrl` key names are part of the instance's datastore target, so changing them is refused once a schema exists — see [Changing the datastore target](#changing-the-datastore-target). Credential keys and the values behind any key are not: rotate freely. |
 | `tls` | [`DatabaseTLSSpec`](#databasetlsspec) | TLS for the PostgreSQL connection. |
 
 ### MigrationSpec
