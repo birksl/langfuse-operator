@@ -128,7 +128,7 @@ func (r *SecretController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating secret status: %w", err)
+		return statusWriteFailed(err, "updating secret status")
 	}
 
 	log.Info("reconciled secrets", "instance", instance.Name)

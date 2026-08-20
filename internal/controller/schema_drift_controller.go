@@ -86,7 +86,7 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 			ObservedGeneration: instance.Generation,
 		})
 		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating schema drift status: %w", err)
+			return statusWriteFailed(err, "updating schema drift status")
 		}
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -149,7 +149,7 @@ func (r *SchemaDriftController) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating schema drift status: %w", err)
+		return statusWriteFailed(err, "updating schema drift status")
 	}
 
 	log.Info("reconciled schema drift detection", "instance", instance.Name, "requeueAfter", requeueAfter)
