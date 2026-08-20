@@ -88,22 +88,32 @@ func resolveDatabaseEndpoint(ctx context.Context, c client.Client, instance *v1a
 
 // parsePostgresURL extracts host and port from a postgres:// or postgresql:// URL.
 //
-// It deliberately does not use net/url: that rejects a bare '@' in the userinfo
-// per RFC 3986, but Prisma and the migration Job's init container both split on
-// the last '@', so a password containing one connects fine. Failing here would
-// report a healthy instance as unreachable.
+// It deliberately does not use net/url. That follows RFC 3986 and rejects a bare
+// '@' in the userinfo, while Prisma parses to the WHATWG URL spec — which ends
+// the authority at the first '/', '?' or '#' and takes the *last* '@' within it
+// as the credential separator. This function implements the WHATWG rule so that
+// what the probe accepts is what Langfuse can connect with: a password holding
+// an '@' or a ':' is fine, one holding '/', '?' or '#' hides the host from both
+// parsers and must be percent-encoded. The migration Job's init container splits
+// on the last '@' too (${rest##*@}).
 func parsePostgresURL(raw string) (string, string, error) {
 	rest := strings.TrimSpace(raw)
 	if i := strings.Index(rest, "://"); i >= 0 {
 		rest = rest[i+3:]
 	}
 
-	// Authority only — a '@' in the path or query is not a credential.
+	// Authority only — a '@' in the path, query or fragment is not a credential.
+	// '#' belongs in this set: Prisma reads it as the start of a fragment, so a
+	// password containing one leaves the probe green against a database the
+	// application cannot reach.
 	authority := rest
-	if i := strings.IndexAny(authority, "/?"); i >= 0 {
+	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
 		authority = authority[:i]
 	}
 	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		if err := checkPercentEncoding(authority[:i]); err != nil {
+			return "", "", err
+		}
 		authority = authority[i+1:]
 	}
 	if authority == "" {
@@ -117,16 +127,44 @@ func parsePostgresURL(raw string) (string, string, error) {
 	if host == "" {
 		return "", "", errors.New("postgres URL has no host")
 	}
-	// A non-numeric port means the authority was mis-split, and only '/' or '?'
-	// in the credentials can do that: both end the authority, hiding the host
-	// from this parser and from Prisma alike. Name those two and nothing else —
-	// '@' and ':' are handled above, and listing them here sends people off to
-	// re-encode a password that was never the problem.
+	// A non-numeric port means the authority was mis-split, and only '/', '?' or
+	// '#' in the credentials can do that: each ends the authority, hiding the
+	// host from this parser and from Prisma alike. Name those three and nothing
+	// else — '@' and ':' are handled above, and listing them here sends people
+	// off to re-encode a password that was never the problem.
 	if _, err := strconv.Atoi(port); err != nil {
-		return "", "", fmt.Errorf("invalid port %q — percent-encode '/' as %%2F and '?' as %%3F "+
-			"in the credentials; '@' and ':' need no encoding", port)
+		return "", "", fmt.Errorf("invalid port %q — percent-encode '/' as %%2F, '?' as %%3F and "+
+			"'#' as %%23 in the credentials; '@' and ':' need no encoding", port)
 	}
 	return host, port, nil
+}
+
+// checkPercentEncoding rejects a lone '%' in the credentials — one not starting
+// a valid %XX escape.
+//
+// Prisma percent-decodes the userinfo, so such a password is not the password
+// the user thinks they set: it either fails to decode or decodes to something
+// else, and the operator's own TCP probe would never notice because it discards
+// the credentials. Langfuse's entrypoint runs the same check (stripping valid
+// escapes, then looking for what is left) before blaming the database.
+//
+// A well-formed escape is left alone: %73 may well be intended.
+func checkPercentEncoding(credentials string) error {
+	for i := 0; i < len(credentials); i++ {
+		if credentials[i] != '%' {
+			continue
+		}
+		if i+2 >= len(credentials) || !isHex(credentials[i+1]) || !isHex(credentials[i+2]) {
+			return fmt.Errorf("credentials contain a '%%' that does not start a valid escape — " +
+				"percent-encode it as %%25 (Prisma decodes the credentials before connecting)")
+		}
+		i += 2
+	}
+	return nil
+}
+
+func isHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 // ─── ClickHouse ─────────────────────────────────────────────────────────────

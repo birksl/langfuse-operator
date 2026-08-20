@@ -74,12 +74,19 @@ func TestParsePostgresURL(t *testing.T) {
 		{"unencoded @ with port", "postgres://u:p@ss@db:6543/x", "db", "6543", false},
 		{"percent-encoded @ still works", "postgres://u:p%40ss@db:5432/x", "db", "5432", false},
 		{"colon in password", "postgres://u:p:ass@db:5432/x", "db", "5432", false},
-		{"hash in password", "postgres://u:p#ass@db/x", "db", "5432", false},
+		{"percent-encoded reserved chars are fine", "postgres://u:p%2Fa%23ss@db:5432/x", "db", "5432", false},
 
-		// An unencoded '/' in a password is not recoverable — it is
-		// indistinguishable from the start of the path, in any parser. Langfuse's
-		// own entrypoint tells users to percent-encode it for the same reason.
+		// '/', '?' and '#' each end the authority under the WHATWG rules Prisma
+		// follows, so the host after them is invisible to it — accepting these
+		// would leave a green probe against a database Langfuse cannot reach.
 		{"unencoded slash in password is rejected, not mis-parsed", "postgres://u:p/ass@db/x", "", "", true},
+		{"unencoded question mark in password is rejected", "postgres://u:p?ass@db/x", "", "", true},
+		{"unencoded hash in password is rejected", "postgres://u:p#ass@db/x", "", "", true},
+
+		// Prisma percent-decodes the credentials, so a stray '%' does not mean
+		// what the user typed. A well-formed escape is left alone.
+		{"lone percent in password is rejected", "postgres://u:p%ss@db:5432/x", "", "", true},
+		{"trailing percent in password is rejected", "postgres://u:pass%@db:5432/x", "", "", true},
 
 		// A '@' after the authority belongs to the path or query, not the
 		// credentials, so it must not be mistaken for a separator.
