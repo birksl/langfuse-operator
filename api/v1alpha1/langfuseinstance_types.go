@@ -73,7 +73,8 @@ type WebSpec struct {
 	// PodDisruptionBudget configures the PDB for Web pods.
 	// +optional
 	PodDisruptionBudget *PDBSpec `json:"podDisruptionBudget,omitempty"`
-	// TopologySpreadConstraints configures topology spread.
+	// TopologySpreadConstraints is deprecated and ignored; removal in 0.12.0.
+	// No constraints reach the pod templates. Use Affinity instead.
 	// +optional
 	TopologySpreadConstraints *TopologySpreadSpec `json:"topologySpreadConstraints,omitempty"`
 	// ExtraEnv allows injecting additional environment variables.
@@ -501,7 +502,9 @@ type MigrationSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	RunOnDeploy *bool `json:"runOnDeploy,omitempty"`
-	// BackgroundMigrations configures background migration handling.
+	// BackgroundMigrations is deprecated and ignored; removal in 0.12.0.
+	// Langfuse runs its background migrations inside the worker; the operator
+	// neither monitors nor waits on them.
 	// +optional
 	BackgroundMigrations *BackgroundMigrationSpec `json:"backgroundMigrations,omitempty"`
 }
@@ -535,7 +538,9 @@ type ClickHouseSpec struct {
 	// External references an external ClickHouse instance.
 	// +optional
 	External *ExternalClickHouseSpec `json:"external,omitempty"`
-	// Encryption configures ClickHouse encryption settings.
+	// Encryption is deprecated and ignored; removal in 0.12.0. It encrypts
+	// nothing — encryption at rest belongs to the storage layer, so use an
+	// encrypted storageClass or your provider's encryption.
 	// +optional
 	Encryption *ClickHouseEncryptionSpec `json:"encryption,omitempty"`
 	// Retention configures data retention policies.
@@ -715,7 +720,9 @@ type StoragePressureSpec struct {
 	// +kubebuilder:default=90
 	// +optional
 	CriticalThresholdPercent int32 `json:"criticalThresholdPercent,omitempty"`
-	// PruneOldestPartitions enables pruning of oldest partitions.
+	// PruneOldestPartitions is deprecated and ignored; removal in 0.12.0.
+	// Dropping partitions is irreversible data loss, so the operator raises the
+	// StoragePressure condition and leaves the decision to a human.
 	// +optional
 	PruneOldestPartitions bool `json:"pruneOldestPartitions,omitempty"`
 	// MinRetainDays is the minimum retention even under storage pressure.
@@ -733,7 +740,9 @@ type SchemaDriftSpec struct {
 	// +kubebuilder:default=60
 	// +optional
 	CheckIntervalMinutes int32 `json:"checkIntervalMinutes,omitempty"`
-	// AutoRepair enables automatic schema repair.
+	// AutoRepair is deprecated and ignored; removal in 0.12.0. Repairing means
+	// recreating Langfuse's own tables, where wrong DDL would corrupt the schema
+	// for good; SchemaDriftChecked reports the drift instead.
 	// +optional
 	AutoRepair bool `json:"autoRepair,omitempty"`
 }
@@ -1160,6 +1169,8 @@ type ComponentCircuitBreakerSpec struct {
 // ─── Upgrade Strategy ───────────────────────────────────────────────────────
 
 // UpgradeSpec configures the upgrade strategy.
+// Deprecated: no field in this block or its children is read; removal in 0.12.0.
+// See LangfuseInstanceSpec.Upgrade.
 type UpgradeSpec struct {
 	// Strategy is the upgrade strategy.
 	// +kubebuilder:validation:Enum=rolling
@@ -1277,7 +1288,10 @@ type LangfuseInstanceSpec struct {
 	// CircuitBreaker configures dependency circuit breaking.
 	// +optional
 	CircuitBreaker *CircuitBreakerSpec `json:"circuitBreaker,omitempty"`
-	// Upgrade configures the upgrade strategy.
+	// Upgrade is deprecated and ignored in full; removal in 0.12.0. No
+	// controller reads any of it, so autoRollback never rolls back and
+	// backupDatabase takes no backup. Upgrade by changing image.tag, and
+	// control migrations with database.migration.runOnDeploy.
 	// +optional
 	Upgrade *UpgradeSpec `json:"upgrade,omitempty"`
 }

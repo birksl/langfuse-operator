@@ -75,11 +75,13 @@ runs older code against a newer schema — fine for Langfuse's forward-compatibl
 changes, not something to count on across a major version. Take a database
 backup before a major upgrade and treat that, not the tag, as the way back.
 
-## `spec.upgrade` Is Not Implemented
+## `spec.upgrade` Is Deprecated and Ignored
 
 The CRD accepts a `spec.upgrade` block — `strategy`, `preUpgrade`,
 `rollingUpdate`, `postUpgrade` with `autoRollback` — and **no controller reads
-any of it**. Setting those fields changes nothing:
+any of it**. Setting any of it raises the `Deprecated` condition on the
+instance, and the whole block is removed in **0.12.0**. It changes nothing
+today:
 
 | Field | Reality |
 |---|---|

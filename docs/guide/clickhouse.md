@@ -74,8 +74,8 @@ Resource presets:
 
 ## Encryption
 
-::: warning Accepted but not implemented
-`clickhouse.encryption` is not read by any controller — setting `enabled: true` encrypts nothing. Encryption at rest belongs to the storage layer: use an encrypted `storageClass` for a self-hosted cluster, or your provider's encryption for a managed one. Blob-storage encryption is configured on the bucket.
+::: danger Deprecated and ignored, removal in 0.12.0
+`clickhouse.encryption` is not read by any controller — setting `enabled: true` encrypts nothing and raises the `Deprecated` condition. Encryption at rest belongs to the storage layer: use an encrypted `storageClass` for a self-hosted cluster, or your provider's encryption for a managed one. Blob-storage encryption is configured on the bucket.
 :::
 
 ## Data Retention
@@ -119,7 +119,11 @@ The check is table-level — `traces`, `observations`, `scores`, `schema_migrati
 
 The result lands on the `SchemaDriftChecked` condition, whose polarity is worth noting: `True` means the check ran and found everything, `False` with reason `TablesMissing` means drift, and `Unknown` means the check could not reach ClickHouse.
 
-Two limitations to be aware of:
+On a clustered instance the check reads through `clusterAllReplicas`, so it sees every node, and it checks engines as well as presence. Two failures it now catches that a single-node read could not:
 
-- **`autoRepair` does nothing.** The field is accepted, but repairing means recreating Langfuse's own tables, and a wrong `CREATE TABLE` here would corrupt the schema for good. When drift is found with `autoRepair: true` the condition says so rather than pretending a repair happened.
-- **The check sees one node.** It reads `system.tables` from whichever node answers, so on a cluster it cannot tell you that a table is missing on *some* nodes. Storage pressure reads every node; this check does not yet.
+- **Tables on one replica only**, reported as `TablesMissing` naming the nodes that are short. This is what an unclustered migration produces against a replicated cluster: every query the Service routes to another replica fails, while the schema looks healthy from the node that has the tables.
+- **Tables present everywhere but not replicated**, reported as `TablesNotReplicated` with the engine found. `ReplacingMergeTree` where `cluster.enabled` is set means the copies never sync, so the replicas diverge silently.
+
+Both mean the migrations ran in the wrong mode, and neither is repairable in place — ClickHouse fixes a table's engine at `CREATE` time. Recreate the database (`DROP DATABASE … ON CLUSTER default SYNC`, then `CREATE DATABASE … ON CLUSTER default`) and re-migrate with `cluster.enabled: true`.
+
+`autoRepair` is **deprecated and ignored, removal in 0.12.0**: repairing means recreating Langfuse's own tables, and a wrong `CREATE TABLE` would corrupt the schema for good.

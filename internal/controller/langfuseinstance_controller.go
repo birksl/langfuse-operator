@@ -393,27 +393,72 @@ func (r *LangfuseInstanceReconciler) updateStatus(ctx context.Context, instance,
 	return updateInstanceStatus(ctx, r.Client, instance, original)
 }
 
-// setDeprecationCondition flags spec fields scheduled for removal. Managed
-// datastore modes are dev/CI only and go away in 0.11.0; surfacing that on the
-// CR (and in the log) gives users a release to migrate instead of discovering
-// it when an upgrade rejects their spec.
+// deprecation is one spec field on its way out. The removal release travels
+// with the field rather than being fixed for the whole message: fields
+// deprecated in different releases go away in different ones, and a single
+// "removal in X" line was already wrong the moment a second wave was added.
+type deprecation struct {
+	field, removal, why string
+}
+
+func (d deprecation) String() string {
+	return fmt.Sprintf("%s (removal in %s — %s)", d.field, d.removal, d.why)
+}
+
+// setDeprecationCondition flags spec fields scheduled for removal, so users get
+// a release to migrate instead of discovering it when an upgrade rejects their
+// spec.
 //
-// spec.database.managed is deliberately absent here — it is rejected outright
-// in langfuse.BuildConfig, which reports a ConfigError condition instead.
+// spec.database.managed is deliberately absent — it is rejected outright in
+// langfuse.BuildConfig, which reports a ConfigError condition instead.
 func setDeprecationCondition(ctx context.Context, instance *v1alpha1.LangfuseInstance) {
 	var deprecated []string
-	if instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.Managed != nil {
-		deprecated = append(deprecated, "spec.clickhouse.managed (single-node, no replication or backups, "+
-			"unsuitable for production — use external: ClickHouse Cloud or the Altinity operator)")
-	}
-	if instance.Spec.Redis != nil && instance.Spec.Redis.Managed != nil {
-		deprecated = append(deprecated, "spec.redis.managed (single-node, no replication or backups, "+
-			"unsuitable for production — use external: a managed Redis service or a Redis operator)")
-	}
-	if instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil {
-		deprecated = append(deprecated, "spec.observability.serviceMonitor (ignored: Langfuse serves no "+
-			"Prometheus endpoint, so the ServiceMonitor only ever pointed Prometheus at a JSON health "+
-			"route and reported the target down — use spec.observability.otel)")
+	for _, d := range []struct {
+		inUse bool
+		deprecation
+	}{
+		{instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.Managed != nil, deprecation{
+			"spec.clickhouse.managed", "0.11.0",
+			"single-node, no replication or backups, unsuitable for production; " +
+				"use external: ClickHouse Cloud or the Altinity operator"}},
+		{instance.Spec.Redis != nil && instance.Spec.Redis.Managed != nil, deprecation{
+			"spec.redis.managed", "0.11.0",
+			"single-node, no replication or backups, unsuitable for production; " +
+				"use external: a managed Redis service or a Redis operator"}},
+		{instance.Spec.Observability != nil && instance.Spec.Observability.ServiceMonitor != nil, deprecation{
+			"spec.observability.serviceMonitor", "0.11.0",
+			"ignored: Langfuse serves no Prometheus endpoint, so this only ever pointed " +
+				"Prometheus at a JSON health route and reported the target down; " +
+				"use spec.observability.otel"}},
+		{instance.Spec.Upgrade != nil, deprecation{
+			"spec.upgrade", "0.12.0",
+			"ignored in full: no controller reads strategy, preUpgrade, rollingUpdate or " +
+				"postUpgrade, so autoRollback and backupDatabase never happen. Upgrade by " +
+				"changing spec.image.tag; control migrations with " +
+				"spec.database.migration.runOnDeploy"}},
+		{clickHouseEncryptionSet(instance), deprecation{
+			"spec.clickhouse.encryption", "0.12.0",
+			"ignored: encrypts nothing. Use an encrypted storageClass or your provider's " +
+				"encryption at rest"}},
+		{topologySpreadSet(instance), deprecation{
+			"spec.web.topologySpreadConstraints", "0.12.0",
+			"ignored: no constraints reach the pod templates. Use affinity instead"}},
+		{prunePolicySet(instance), deprecation{
+			"spec.clickhouse.retention.storagePressure.pruneOldestPartitions/minRetainDays", "0.12.0",
+			"ignored: dropping partitions is irreversible, so the operator reports " +
+				"StoragePressure and leaves the decision to a human"}},
+		{schemaDriftAutoRepairSet(instance), deprecation{
+			"spec.clickhouse.schemaDrift.autoRepair", "0.12.0",
+			"ignored: repairing means recreating Langfuse's own tables, and wrong DDL " +
+				"would corrupt the schema; the condition reports the drift instead"}},
+		{backgroundMigrationsSet(instance), deprecation{
+			"spec.database.migration.backgroundMigrations", "0.12.0",
+			"ignored: Langfuse runs its background migrations in the worker and the " +
+				"operator does not monitor them"}},
+	} {
+		if d.inUse {
+			deprecated = append(deprecated, d.String())
+		}
 	}
 
 	if len(deprecated) == 0 {
@@ -421,18 +466,42 @@ func setDeprecationCondition(ctx context.Context, instance *v1alpha1.LangfuseIns
 		return
 	}
 
-	message := fmt.Sprintf("Deprecated fields in use, removal in 0.11.0: %s",
-		strings.Join(deprecated, "; "))
-
 	logf.FromContext(ctx).Info("WARNING: deprecated spec fields in use", "fields", deprecated)
 
 	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 		Type:               conditionTypeDeprecated,
 		Status:             metav1.ConditionTrue,
-		Reason:             "ManagedDatastoresDeprecated",
-		Message:            message,
+		Reason:             "DeprecatedFieldsInUse",
+		Message:            "Deprecated fields in use: " + strings.Join(deprecated, "; "),
 		ObservedGeneration: instance.Generation,
 	})
+}
+
+func clickHouseEncryptionSet(instance *v1alpha1.LangfuseInstance) bool {
+	return instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.Encryption != nil
+}
+
+// Only WebSpec carries the field; WorkerSpec never had it.
+func topologySpreadSet(instance *v1alpha1.LangfuseInstance) bool {
+	return instance.Spec.Web.TopologySpreadConstraints != nil
+}
+
+func prunePolicySet(instance *v1alpha1.LangfuseInstance) bool {
+	if instance.Spec.ClickHouse == nil || instance.Spec.ClickHouse.Retention == nil {
+		return false
+	}
+	return instance.Spec.ClickHouse.Retention.StoragePressure != nil &&
+		instance.Spec.ClickHouse.Retention.StoragePressure.PruneOldestPartitions
+}
+
+func schemaDriftAutoRepairSet(instance *v1alpha1.LangfuseInstance) bool {
+	return instance.Spec.ClickHouse != nil && instance.Spec.ClickHouse.SchemaDrift != nil &&
+		instance.Spec.ClickHouse.SchemaDrift.AutoRepair
+}
+
+func backgroundMigrationsSet(instance *v1alpha1.LangfuseInstance) bool {
+	return instance.Spec.Database != nil && instance.Spec.Database.Migration != nil &&
+		instance.Spec.Database.Migration.BackgroundMigrations != nil
 }
 
 // podIssuesFor returns pod-level problems for a component, but only when the

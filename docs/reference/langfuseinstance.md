@@ -63,10 +63,10 @@ Watch the polarity: most are named for the healthy state, but `StoragePressure` 
 | `MigrationsComplete` | Migrations have finished for the deployed version and target | `MigrationStarted`, `MigrationInProgress`, `MigrationFailed`, and a refusal when the target cannot be migrated into |
 | `DatastoreTargetUnchanged` | *Absent when nothing is wrong.* Present and `False` while the spec points at datastores the schema was not migrated into, which freezes reconciliation — see [Changing the datastore target](#changing-the-datastore-target) | `TargetChangedAfterMigration` |
 | `RetentionConfigured` | ClickHouse accepted every TTL statement | `NoTTLConfigured`, `ApplyFailed` |
-| `SchemaDriftChecked` | The check ran and found every expected table | `Disabled` and `TablesMissing` report `False`; `CheckFailed` reports `Unknown` |
+| `SchemaDriftChecked` | The check ran and found every expected table, on every node | `Disabled`, `TablesMissing` and `TablesNotReplicated` report `False`; `CheckFailed` reports `Unknown` |
 | `StoragePressure` | **A threshold is exceeded** — `False` is the healthy state here | `WarningThresholdExceeded`, `CriticalThresholdExceeded`, `WithinThresholds`; `QueryFailed` and `NoCapacityReported` report `Unknown`. See [StoragePressureSpec](#storagepressurespec) |
 | `CircuitBreakerHealthy` | No circuit breaker is tripped. The tripped state also appears in `status.worker.circuitBreakerActive` | `AllDependenciesHealthy`, `CircuitOpen` |
-| `Deprecated` | *Absent when nothing is wrong.* The spec uses fields that go away in 0.11.0 | `ManagedDatastoresDeprecated` |
+| `Deprecated` | *Absent when nothing is wrong.* The spec uses fields scheduled for removal. The message names each field and the release it goes in | `DeprecatedFieldsInUse` |
 
 ---
 
@@ -215,8 +215,8 @@ To move an instance to different datastores, create a **separate `LangfuseInstan
 
 ### UpgradeSpec
 
-::: warning Accepted but not implemented
-No controller reads `spec.upgrade`. Setting any field below changes nothing about how an upgrade runs. Upgrading works — change `spec.image.tag` — it just is not configurable through this block. See [Upgrades](../guide/upgrades.md#specupgrade-is-not-implemented) for what governs each behaviour instead.
+::: danger Deprecated and ignored, removal in 0.12.0
+No controller reads `spec.upgrade`. Setting any field below changes nothing about how an upgrade runs, raises the `Deprecated` condition, and the block goes away in 0.12.0. Upgrading works — change `spec.image.tag` — it just is not configurable here. See [Upgrades](../guide/upgrades.md#specupgrade-is-deprecated-and-ignored) for what governs each behaviour instead.
 :::
 
 | Field | Type | Default | Description |
@@ -257,7 +257,7 @@ The remaining `*Spec` types referenced above. Field defaults marked `*T` mean th
 
 ### TopologySpreadSpec
 
-**Accepted but not implemented** — no controller reads it, so no `topologySpreadConstraints` reach the pod templates. Spread pods with `spec.web.affinity` / `spec.worker.affinity` instead.
+**Deprecated and ignored, removal in 0.12.0** — no controller reads it, so no `topologySpreadConstraints` reach the pod templates, and using it raises the `Deprecated` condition. Spread pods with `spec.web.affinity` / `spec.worker.affinity` instead.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -359,7 +359,7 @@ Reachable only from the rejected `managed` mode above, so the operator takes no 
 
 ### BackgroundMigrationSpec
 
-**Accepted but not implemented** — the operator has a client for `/api/public/background-migrations` but no controller calls it, so background migrations are neither monitored nor waited on. Langfuse runs them itself in the worker.
+**Deprecated and ignored, removal in 0.12.0** — the operator has a client for `/api/public/background-migrations` but no controller calls it, so background migrations are neither monitored nor waited on, and using this raises the `Deprecated` condition. Langfuse runs them itself in the worker.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -399,7 +399,7 @@ Reachable only from the rejected `managed` mode above, so the operator takes no 
 
 ### ClickHouseEncryptionSpec
 
-**Accepted but not implemented** — no controller reads it. Encrypt at the storage layer instead; see [ClickHouse](../guide/clickhouse.md#encryption).
+**Deprecated and ignored, removal in 0.12.0** — no controller reads it, and using it raises the `Deprecated` condition. Encrypt at the storage layer instead; see [ClickHouse](../guide/clickhouse.md#encryption).
 
 | Field | Type | Description |
 |---|---|---|
@@ -430,8 +430,8 @@ Applies to the ClickHouse database named by [`clickhouse.database`](#clickhouses
 | `enabled` | bool | `false` | Monitor ClickHouse storage pressure |
 | `warningThresholdPercent` | int32 | `75` | Report `StoragePressure=True` with reason `WarningThresholdExceeded` above this |
 | `criticalThresholdPercent` | int32 | `90` | Report `StoragePressure=True` with reason `CriticalThresholdExceeded` above this |
-| `pruneOldestPartitions` | bool | `false` | **Not implemented.** Dropping partitions is irreversible data loss, so the operator reports and leaves the decision to a human |
-| `minRetainDays` | int32 | `7` | Floor for retention even under pressure. Only meaningful once pruning exists |
+| `pruneOldestPartitions` | bool | `false` | **Deprecated and ignored, removal in 0.12.0.** Dropping partitions is irreversible data loss, so the operator reports and leaves the decision to a human. Setting it raises the `Deprecated` condition |
+| `minRetainDays` | int32 | `7` | Ignored — it only had meaning alongside pruning |
 
 The percentage is the **fullest node's**, not the cluster average: ClickHouse writes fail on whichever node runs out of disk, and averaging it with emptier peers hides that until it happens. On a cluster the condition message names that node and carries the cluster totals beside its own.
 
@@ -443,9 +443,11 @@ The percentage is the **fullest node's**, not the cluster average: ClickHouse wr
 |---|---|---|---|
 | `enabled` | bool | `false` | Periodic schema drift detection. Reports on `SchemaDriftChecked` and `status.clickhouse.schemaDrift` |
 | `checkIntervalMinutes` | int32 | `60` | Interval between checks |
-| `autoRepair` | bool | `false` | **Not implemented.** Repair means recreating Langfuse's own tables, and wrong DDL here would corrupt the schema; the condition reports the drift instead |
+| `autoRepair` | bool | `false` | **Deprecated and ignored, removal in 0.12.0.** Repair means recreating Langfuse's own tables, and wrong DDL here would corrupt the schema; the condition reports the drift instead |
 
-The check is table-level (`traces`, `observations`, `scores`, `schema_migrations`), not column-level — Langfuse changes its schema between versions, so a column manifest here would report drift on every upgrade. It reads `system.tables` from whichever node answers, so on a cluster it cannot report a table missing from only some nodes.
+The check is table-level (`traces`, `observations`, `scores`, `schema_migrations`), not column-level — Langfuse changes its schema between versions, so a column manifest here would report drift on every upgrade.
+
+On a clustered instance it reads `system.tables` through `clusterAllReplicas`, so it sees every node and reports which ones are short of a table. It also checks engines: with `cluster.enabled` set, a table whose engine is not `Replicated*` is reported as `TablesNotReplicated` — that is what an unclustered migration produces against a replicated cluster, and it makes every query routed to another replica fail while the tables look present from the node that has them.
 
 ### ManagedRedisSpec
 
@@ -686,7 +688,7 @@ Langfuse serves no Prometheus endpoint, so the ServiceMonitor this created could
 
 ### PreUpgradeSpec
 
-Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+Part of the deprecated `spec.upgrade` block, removed in 0.12.0; see [UpgradeSpec](#upgradespec).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -695,7 +697,7 @@ Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
 
 ### RollingUpdateSpec
 
-Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+Part of the deprecated `spec.upgrade` block, removed in 0.12.0; see [UpgradeSpec](#upgradespec).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -704,7 +706,7 @@ Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
 
 ### PostUpgradeSpec
 
-Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+Part of the deprecated `spec.upgrade` block, removed in 0.12.0; see [UpgradeSpec](#upgradespec).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
