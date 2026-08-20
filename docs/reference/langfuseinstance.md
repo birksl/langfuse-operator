@@ -42,26 +42,31 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `redis` | ConnectionStatus | Redis connection state |
 | `blobStorage` | BlobStorageStatus | Blob storage state |
 | `secrets` | SecretsStatus | Secret management state |
-| `version` | string | Currently running Langfuse version |
-| `publicUrl` | string | Public URL of the instance |
+| `version` | string | Langfuse version actually deployed. Held back while `DatastoreTargetUnchanged` is `False`, since nothing rolled out |
+| `publicUrl` | string | Public URL of the instance, held back on the same terms as `version` |
+| `organizations` | int32 | Never written — the field exists but no controller counts them. Use `kubectl get langfuseorganizations` |
+| `projects` | int32 | Never written; as above |
 | `conditions` | []Condition | Standard Kubernetes conditions |
 
 ### Conditions
 
-| Type | Description |
-|---|---|
-| `Ready` | All components are operational |
-| `DatabaseReady` | PostgreSQL is connected and migrated |
-| `ClickHouseReady` | ClickHouse is connected |
-| `RedisReady` | Redis is connected |
-| `BlobStorageReady` | Blob storage is accessible |
-| `MigrationsComplete` | All migrations have finished |
-| `DatastoreTargetUnchanged` | Present and `False` only while the spec points at datastores the schema was not migrated into, which freezes reconciliation; removed otherwise. See [Changing the datastore target](#changing-the-datastore-target) |
-| `SecretsReady` | All secrets are generated/available |
-| `ClickHouseRetentionApplied` | TTL policies are active |
-| `ClickHouseSchemaDrift` | Schema drift detected |
-| `StoragePressure` | ClickHouse disk usage against the configured thresholds, measured on the fullest node — see [StoragePressureSpec](#storagepressurespec) |
-| `CircuitBreakerActive` | A circuit breaker is tripped |
+Watch the polarity: most are named for the healthy state, but `StoragePressure` and `Deprecated` are named for the problem, so `True` is the bad news. Two are absent entirely when there is nothing wrong.
+
+| Type | `True` means | Notable reasons |
+|---|---|---|
+| `Ready` | The instance is fully operational — mirrors `status.ready` | The reason restates the phase: `AllComponentsReady`, `ComponentsStarting`, `MigrationInProgress`, `ComponentDegraded`, `ReconcileError`; plus `ConfigError` when the spec cannot be turned into a valid configuration |
+| `DatabaseReady` | PostgreSQL answered a connection probe | `Connected`, `Unreachable`, `ConfigError` |
+| `ClickHouseReady` | ClickHouse answered `/ping` | `Connected`, `Unreachable`, `ConfigError` |
+| `RedisReady` | Redis answered `PING` | `Connected`, `Unreachable`, `ConfigError` |
+| `BlobStorageReady` | The endpoint accepted a TCP connection — **or** none is configured, which reports `True` with reason `NotConfigured` | `Connected`, `Unreachable`, `ConfigError` |
+| `WebReady`, `WorkerReady` | The component's Deployment has ready replicas | `DeploymentReady`, `DeploymentNotReady`, `DeploymentNotFound`, `FetchError` — the message names the pod-level cause when there is one |
+| `MigrationsComplete` | Migrations have finished for the deployed version and target | `MigrationStarted`, `MigrationInProgress`, `MigrationFailed`, and a refusal when the target cannot be migrated into |
+| `DatastoreTargetUnchanged` | *Absent when nothing is wrong.* Present and `False` while the spec points at datastores the schema was not migrated into, which freezes reconciliation — see [Changing the datastore target](#changing-the-datastore-target) | `TargetChangedAfterMigration` |
+| `RetentionConfigured` | ClickHouse accepted every TTL statement | `NoTTLConfigured`, `ApplyFailed` |
+| `SchemaDriftChecked` | The check ran and found every expected table | `Disabled` and `TablesMissing` report `False`; `CheckFailed` reports `Unknown` |
+| `StoragePressure` | **A threshold is exceeded** — `False` is the healthy state here | `WarningThresholdExceeded`, `CriticalThresholdExceeded`, `WithinThresholds`; `QueryFailed` and `NoCapacityReported` report `Unknown`. See [StoragePressureSpec](#storagepressurespec) |
+| `CircuitBreakerHealthy` | No circuit breaker is tripped. The tripped state also appears in `status.worker.circuitBreakerActive` | `AllDependenciesHealthy`, `CircuitOpen` |
+| `Deprecated` | *Absent when nothing is wrong.* The spec uses fields that go away in 0.11.0 | `ManagedDatastoresDeprecated` |
 
 ---
 
@@ -84,7 +89,7 @@ Deploys and manages the complete Langfuse stack: Web, Worker, and all dependent 
 | `autoscaling` | *AutoscalingSpec | | HPA configuration |
 | `resources` | *ResourceRequirements | | CPU/memory requests and limits |
 | `podDisruptionBudget` | *PDBSpec | | PDB configuration |
-| `topologySpreadConstraints` | *TopologySpreadSpec | | Topology spread |
+| `topologySpreadConstraints` | [`*TopologySpreadSpec`](#topologyspreadspec) | | Not read; use `affinity` |
 | `extraEnv` | []EnvVar | | Additional environment variables |
 | `extraVolumeMounts` | []VolumeMount | | Additional volume mounts |
 | `extraVolumes` | []Volume | | Additional volumes |
@@ -210,12 +215,16 @@ To move an instance to different datastores, create a **separate `LangfuseInstan
 
 ### UpgradeSpec
 
+::: warning Accepted but not implemented
+No controller reads `spec.upgrade`. Setting any field below changes nothing about how an upgrade runs. Upgrading works — change `spec.image.tag` — it just is not configurable through this block. See [Upgrades](../guide/upgrades.md#specupgrade-is-not-implemented) for what governs each behaviour instead.
+:::
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `strategy` | string | `rolling` | Upgrade strategy |
-| `preUpgrade` | [`*PreUpgradeSpec`](#preupgradespec) | | Actions before upgrade |
-| `rollingUpdate` | [`*RollingUpdateSpec`](#rollingupdatespec) | | Rolling update parameters |
-| `postUpgrade` | [`*PostUpgradeSpec`](#postupgradespec) | | Actions after upgrade |
+| `strategy` | string | `rolling` | Not read |
+| `preUpgrade` | [`*PreUpgradeSpec`](#preupgradespec) | | Not read |
+| `rollingUpdate` | [`*RollingUpdateSpec`](#rollingupdatespec) | | Not read |
+| `postUpgrade` | [`*PostUpgradeSpec`](#postupgradespec) | | Not read |
 
 ---
 
@@ -248,11 +257,13 @@ The remaining `*Spec` types referenced above. Field defaults marked `*T` mean th
 
 ### TopologySpreadSpec
 
+**Accepted but not implemented** — no controller reads it, so no `topologySpreadConstraints` reach the pod templates. Spread pods with `spec.web.affinity` / `spec.worker.affinity` instead.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Toggle topology spread constraints |
-| `maxSkew` | *int32 | `1` | Maximum spread skew |
-| `topologyKey` | string | `topology.kubernetes.io/zone` | Topology domain key |
+| `enabled` | bool | `false` | Not read |
+| `maxSkew` | *int32 | `1` | Not read |
+| `topologyKey` | string | `topology.kubernetes.io/zone` | Not read |
 
 ### EmailPasswordSpec
 
@@ -314,6 +325,8 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 
 ### ManagedDatabaseSpec
 
+**Rejected since 0.10.0, removed in 0.11.0** — `database.managed` was never implemented, so every field below is unreachable. See [Database](../guide/database.md#managed-deprecated).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `instances` | *int32 | `1` | Number of PostgreSQL instances |
@@ -322,6 +335,8 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 | `backup` | [`*DatabaseBackupSpec`](#databasebackupspec) | | Automated backup configuration |
 
 ### DatabaseBackupSpec
+
+Reachable only from the rejected `managed` mode above, so the operator takes no backups of any kind. Configure them on the CloudNativePG `Cluster` you reference, or on your managed provider.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -340,14 +355,16 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `runOnDeploy` | *bool | `true` | Run migrations on every deployment |
-| `backgroundMigrations` | [`*BackgroundMigrationSpec`](#backgroundmigrationspec) | | Background-migration handling |
+| `backgroundMigrations` | [`*BackgroundMigrationSpec`](#backgroundmigrationspec) | | Not read; see below |
 
 ### BackgroundMigrationSpec
 
+**Accepted but not implemented** — the operator has a client for `/api/public/background-migrations` but no controller calls it, so background migrations are neither monitored nor waited on. Langfuse runs them itself in the worker.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | *bool | `true` | Monitor background migrations via `/api/public/background-migrations` |
-| `timeout` | string | `3600s` | Maximum wait |
+| `enabled` | *bool | `true` | Not read |
+| `timeout` | string | `3600s` | Not read |
 
 ### ManagedClickHouseSpec
 
@@ -382,19 +399,23 @@ Configures Langfuse's generic custom OIDC provider (mapped to the upstream `AUTH
 
 ### ClickHouseEncryptionSpec
 
+**Accepted but not implemented** — no controller reads it. Encrypt at the storage layer instead; see [ClickHouse](../guide/clickhouse.md#encryption).
+
 | Field | Type | Description |
 |---|---|---|
-| `enabled` | bool | Encryption at rest |
-| `blobStorage` | bool | Blob-storage encryption |
+| `enabled` | bool | Not read |
+| `blobStorage` | bool | Not read |
 
 ### RetentionSpec
 
+Applies to the ClickHouse database named by [`clickhouse.database`](#clickhousespec). `events` carries no TTL field even though the operator knows the table, so event rows are not expired by this spec.
+
 | Field | Type | Description |
 |---|---|---|
-| `traces` | [`*TableRetentionSpec`](#tableretentionspec) | TTL for trace data |
-| `observations` | [`*TableRetentionSpec`](#tableretentionspec) | TTL for observation data |
-| `scores` | [`*TableRetentionSpec`](#tableretentionspec) | TTL for score data |
-| `storagePressure` | [`*StoragePressureSpec`](#storagepressurespec) | Auto-retention under disk pressure |
+| `traces` | [`*TableRetentionSpec`](#tableretentionspec) | TTL on `traces.timestamp` |
+| `observations` | [`*TableRetentionSpec`](#tableretentionspec) | TTL on `observations.start_time` |
+| `scores` | [`*TableRetentionSpec`](#tableretentionspec) | TTL on `scores.timestamp` |
+| `storagePressure` | [`*StoragePressureSpec`](#storagepressurespec) | Disk-usage reporting; see below |
 
 ### TableRetentionSpec
 
@@ -420,9 +441,11 @@ The percentage is the **fullest node's**, not the cluster average: ClickHouse wr
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Periodic schema drift detection |
+| `enabled` | bool | `false` | Periodic schema drift detection. Reports on `SchemaDriftChecked` and `status.clickhouse.schemaDrift` |
 | `checkIntervalMinutes` | int32 | `60` | Interval between checks |
-| `autoRepair` | bool | `false` | Automatically repair detected drift |
+| `autoRepair` | bool | `false` | **Not implemented.** Repair means recreating Langfuse's own tables, and wrong DDL here would corrupt the schema; the condition reports the drift instead |
+
+The check is table-level (`traces`, `observations`, `scores`, `schema_migrations`), not column-level — Langfuse changes its schema between versions, so a column manifest here would report drift on every upgrade. It reads `system.tables` from whichever node answers, so on a cluster it cannot report a table missing from only some nodes.
 
 ### ManagedRedisSpec
 
@@ -659,25 +682,31 @@ A pod-level failure surfaced into `status.web.issues`, `status.worker.issues`, o
 
 ### PreUpgradeSpec
 
+Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `runMigrations` | *bool | `true` | Run migrations before upgrade |
-| `backupDatabase` | bool | `false` | Trigger a CNPG backup |
+| `runMigrations` | *bool | `true` | Not read. Migrations follow [`database.migration.runOnDeploy`](#migrationspec) |
+| `backupDatabase` | bool | `false` | Not read. The operator has no backup mechanism |
 
 ### RollingUpdateSpec
 
+Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `maxUnavailable` | *int32 | `0` | Max unavailable pods during update |
-| `maxSurge` | *int32 | `1` | Max extra pods during update |
+| `maxUnavailable` | *int32 | `0` | Not read. The Deployments use Kubernetes' rolling-update defaults |
+| `maxSurge` | *int32 | `1` | Not read |
 
 ### PostUpgradeSpec
 
+Part of the inert `spec.upgrade` block; see [UpgradeSpec](#upgradespec).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `runBackgroundMigrations` | *bool | `true` | Monitor background migrations after upgrade |
-| `healthCheckTimeout` | string | `120s` | Timeout for post-upgrade health checks |
-| `autoRollback` | bool | `false` | Revert on health failure |
+| `runBackgroundMigrations` | *bool | `true` | Not read. Langfuse's background migrations are not monitored |
+| `healthCheckTimeout` | string | `120s` | Not read |
+| `autoRollback` | bool | `false` | Not read. Nothing rolls back, and no `UpgradeRolledBack` condition exists |
 
 ## Example
 

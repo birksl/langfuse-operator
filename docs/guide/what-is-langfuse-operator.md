@@ -21,8 +21,8 @@ With a single `LangfuseInstance` custom resource, the operator:
 
 - Creates and configures Web and Worker Deployments
 - Wires up all component connectivity via environment variables
-- Manages database migrations and background migrations on upgrades
-- Generates and rotates secrets automatically
+- Runs database migrations on upgrades, and refuses a datastore target the existing schema does not live in
+- Generates secrets, and rolls the pods when a referenced Secret changes
 - Creates Services, Ingress/Route, NetworkPolicies, HPAs, and PDBs
 - Monitors component health with circuit breakers
 - Tracks ClickHouse storage pressure and schema drift

@@ -18,10 +18,38 @@ The `phase` tells you how to read the situation:
 | `Migrating` | The migration Job is running. |
 | `Running` | All components ready and dependencies reachable. |
 | `Degraded` | Something is unhealthy but may still recover on its own (crash loop while a dependency comes up, a failed connectivity probe). |
-| `Error` | **Needs you.** A misconfiguration that will never resolve by itself — a bad image reference or a missing Secret key. |
+| `Error` | **Needs you.** A misconfiguration that will never resolve by itself — a bad image reference, a missing Secret key, or a datastore target that moved after migrations ran. |
 
 The `Degraded` vs `Error` split is the important one: `Error` means waiting
 longer will not help.
+
+## Reconciliation is frozen
+
+`Error` with a `DatastoreTargetUnchanged` condition set to `False` is a
+deliberate stop, not a failure:
+
+```yaml
+  conditions:
+  - type: DatastoreTargetUnchanged
+    status: "False"
+    reason: TargetChangedAfterMigration
+    message: 'Not reconciling workloads: spec.database "secret/pg#url=database_url,directUrl="
+      -> "secret/pg-new#url=database_url,directUrl=" changed after migrations ran.
+      Revert the change, or create a separate LangfuseInstance for the new target'
+```
+
+The spec now points at datastores the existing schema does not live in, so the
+operator stops before touching any child resource and leaves the pods running
+what they were migrated for. `status.version` and `status.publicUrl` keep
+describing what is actually deployed, so they will disagree with the spec while
+this is set — that is the point.
+
+Revert the change and reconciliation resumes on the next pass. If the new target
+is what you actually want, create a separate `LangfuseInstance` for it and cut
+over once it has migrated; see
+[Changing the datastore target](../reference/langfuseinstance.md#changing-the-datastore-target)
+for what counts as a change — the Secret *name* and the key names that select an
+endpoint do, the values behind them do not.
 
 ## Reading pod issues
 
@@ -69,6 +97,40 @@ entries — status is a diagnosis, not a log.
 | `OOMKilled` | ❌ | Raise `spec.web.resources.limits.memory` / `spec.worker.resources.limits.memory`. |
 | `Unschedulable` | ❌ | No node satisfies the pod — insufficient CPU/memory, or unsatisfiable `nodeSelector`/`affinity`/`tolerations`. |
 
+## Connection Secrets
+
+A `ConfigError` on `DatabaseReady` or `ClickHouseReady` means the operator could
+not make sense of the connection string — it never got as far as dialling, so
+this is not a network problem. Two cases account for most of them:
+
+**Reserved characters in a PostgreSQL password.** A URL is not a place for raw
+`/`, `@`, `:`, `#`, `?` or `%`; percent-encode them (`@` becomes `%40`). An
+unencoded `/` mis-splits the authority and the probe says so rather than dialling
+nonsense:
+
+```
+invalid port "somepassword" — percent-encode any /, @, :, #, ? or % in the credentials
+```
+
+Langfuse's own Prisma client is stricter than the probe here, so encode
+regardless of whether the probe complains.
+
+**A path or query on the ClickHouse URL.** ClickHouse's HTTP interface picks a
+database from a parameter, never from a path segment, so `http://ch:8123/langfuse`
+does not do what it looks like — it breaks every application query, and made the
+probe's `/ping` return 404:
+
+```
+Invalid ClickHouse URL: must not contain a path (got "/langfuse") — select the database with CLICKHOUSE_DB, not a URL path
+```
+
+Use a bare origin (`http://ch:8123`) and set
+[`clickhouse.database`](../reference/langfuseinstance.md#clickhousespec) instead.
+
+If `status.database` and `status.clickhouse` are missing entirely rather than
+reporting `connected: false`, the health monitor has not completed a pass at all
+— check the operator's own logs.
+
 ## Migrations
 
 A migration that fails or hangs reports through `status.migration` and the
@@ -82,6 +144,29 @@ The Job's `wait-for-stores` init container blocks until PostgreSQL and
 ClickHouse accept TCP connections, so an init container stuck here means the
 migration cannot reach a datastore — check the connection Secret and, if you use
 `spec.security.networkPolicy`, that egress to the datastore's port is allowed.
+
+### No Job appears at all
+
+The operator does not run a migration on every reconcile, so an absent Job is
+usually one of:
+
+- **It already ran.** `status.migration.appliedIdentity` records what the last
+  successful migration ran against. While it still matches the spec there is
+  nothing to do, and finished Jobs are removed 3600s after completion — so a
+  successful migration leaves no Job behind for long.
+- **`spec.database.migration.runOnDeploy` is `false`.** Nothing will run until
+  you set it back.
+- **The target moved.** `MigrationsComplete` reports `MigrationFailed` with the
+  components that changed, and no Job is created — see
+  [Reconciliation is frozen](#reconciliation-is-frozen).
+
+A version bump is what legitimately re-opens the gate. Deleting and re-applying
+the `LangfuseInstance` also works in development, since a fresh CR has no
+recorded identity — but Langfuse's migrations are idempotent, so the usual reason
+to want a re-run (tables missing, `SchemaDriftChecked` reporting
+`TablesMissing`) is better answered by checking that the migration reached the
+database you think it did. Note that no Langfuse migration issues
+`CREATE DATABASE`: `clickhouse.database` must already exist.
 
 ## When you still need the pods
 

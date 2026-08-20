@@ -26,47 +26,26 @@ To provide your own values instead, set `secretRef` on the relevant spec fields.
 
 ## Secret Rotation
 
-The operator watches all Secrets referenced in the spec. When a Secret changes, it computes a hash annotation on the affected Deployment to trigger a rolling restart:
+The operator watches every Secret referenced in the spec. When one changes it stamps a hash annotation on the pod templates, which rolls the pods:
 
 ```yaml
 spec:
   secrets:
     rotation:
-      enabled: true     # default: true
+      enabled: true     # not read — rotation detection is always on
 ```
 
-Built-in mappings determine which components restart:
+The hash is **one composite** over every referenced Secret, and it is stamped on both Deployments, so any referenced Secret changing restarts Web *and* Worker. There is no per-secret mapping today, and `spec.secrets.rotation` — both `enabled` and `customMappings` — is not read: detection cannot be turned off, and custom mappings do nothing.
 
-| Secret Type | Restarts |
-|---|---|
-| NextAuth / Salt / OIDC | Web |
-| Redis | Web + Worker |
-| ClickHouse | Web + Worker |
-| Database | Web + Worker |
-| Blob Storage | Worker |
-
-### Custom Mappings
-
-Add custom secret-to-component mappings:
-
-```yaml
-spec:
-  secrets:
-    rotation:
-      enabled: true
-      customMappings:
-        - secretName: custom-api-key
-          restartComponents:
-            - web
-            - worker
-```
+Rotating a credential is safe with respect to the datastore-target freeze: only Secret *names* and endpoint *key names* are part of an instance's target, never the values. See [Changing the datastore target](../reference/langfuseinstance.md#changing-the-datastore-target).
 
 ## How It Works
 
-1. The Secret Controller watches all Secrets referenced by the `LangfuseInstance` spec
-2. On change, it computes a SHA-256 hash of the relevant Secret data
-3. The hash is stored as an annotation on the affected Deployment's pod template:
+1. The Secret Controller watches every Secret referenced by the `LangfuseInstance` spec
+2. On change it hashes each Secret's keys and values in sorted order into one SHA-256 digest
+3. The digest is stamped on both pod templates:
    ```
    langfuse.palena.ai/secret-hash: <sha256>
    ```
-4. Kubernetes detects the annotation change and triggers a rolling update
+4. Kubernetes sees the annotation change and rolls the pods
+5. `status.secrets.lastRotationCheck` is stamped only when a hash actually changed — writing it every pass would make the operator rewrite status forever
