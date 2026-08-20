@@ -47,7 +47,9 @@ The Secret should contain the full PostgreSQL connection string:
 postgresql://user:password@host:5432/langfuse?sslmode=require
 ```
 
-**Percent-encode reserved characters in the password** — a literal `@` must be `%40`. Prisma rejects an unencoded one, and an unencoded `/` also defeats the operator's own endpoint parsing.
+**A `/` or `?` in the password must be percent-encoded** (`%2F`, `%3F`). Both characters end the URL's authority, so they hide the host from every parser — Prisma's and the operator's alike. A `#` needs encoding too (`%23`): Prisma reads it as the start of a fragment.
+
+An `@` does **not** need encoding, and neither does a `:`. Prisma takes the last `@` in the authority as the credential separator, as do the migration Job's init container and the operator's health probe, so `postgres://user:pa@ss@host:5432/db` connects normally. Encoding it as `%40` is also fine — just not required.
 
 The optional `directUrl` key bypasses connection poolers like PgBouncer. Langfuse's Prisma datasource declares `directUrl = env("DIRECT_URL")` and `prisma migrate deploy` prefers it when set, so when you provide it, **that** is the endpoint migrations run against — the `url` only serves the application.
 

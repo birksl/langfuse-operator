@@ -117,11 +117,14 @@ func parsePostgresURL(raw string) (string, string, error) {
 	if host == "" {
 		return "", "", errors.New("postgres URL has no host")
 	}
-	// A non-numeric port means the authority was mis-split — most often an
-	// unencoded '/' in the password, which no parser can recover. Say so rather
-	// than dialling nonsense and reporting the instance unreachable.
+	// A non-numeric port means the authority was mis-split, and only '/' or '?'
+	// in the credentials can do that: both end the authority, hiding the host
+	// from this parser and from Prisma alike. Name those two and nothing else —
+	// '@' and ':' are handled above, and listing them here sends people off to
+	// re-encode a password that was never the problem.
 	if _, err := strconv.Atoi(port); err != nil {
-		return "", "", fmt.Errorf("invalid port %q — percent-encode any /, @, :, #, ? or %% in the credentials", port)
+		return "", "", fmt.Errorf("invalid port %q — percent-encode '/' as %%2F and '?' as %%3F "+
+			"in the credentials; '@' and ':' need no encoding", port)
 	}
 	return host, port, nil
 }

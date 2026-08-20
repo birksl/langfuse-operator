@@ -108,6 +108,25 @@ func TestParsePostgresURL(t *testing.T) {
 	}
 }
 
+// The parser accepts '@' and ':', so an error that tells the user to encode
+// them sends them to change a password that was never the problem — which is
+// exactly how a real instance was misdiagnosed. The advice has to name only the
+// characters that actually end the authority.
+func TestParsePostgresURL_AdviceNamesOnlyTheCharactersThatBreak(t *testing.T) {
+	_, _, err := parsePostgresURL("postgres://u:pa/ss@db:5432/x")
+	if err == nil {
+		t.Fatal("an unencoded '/' in the password should be an error")
+	}
+	for _, want := range []string{"%2F", "%3F", "'@' and ':' need no encoding"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "encode any /, @") {
+		t.Errorf("error %q still tells the user to encode '@'", err)
+	}
+}
+
 // ─── clickHouseOrigin ───────────────────────────────────────────────────────
 
 func TestClickHouseOrigin(t *testing.T) {
@@ -162,6 +181,7 @@ func TestParseHTTPEndpoint(t *testing.T) {
 		{"http://minio:9000", "minio", "9000", false},
 		{"https://s3.eu-central-1.amazonaws.com", "s3.eu-central-1.amazonaws.com", "443", false},
 		{"http://host", "host", "80", false},
+		{"https://s3.shared-storage.svc.cluster.local:3900", "s3.shared-storage.svc.cluster.local", "3900", false},
 	}
 	for _, tc := range cases {
 		host, port, err := parseHTTPEndpoint(tc.in)
