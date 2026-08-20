@@ -140,11 +140,15 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				strings.Join(changed, " and ")),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := r.updateStatus(ctx, instance, original, false); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
-		log.Error(nil, "refusing to reconcile workloads onto a retargeted datastore", "changed", changed)
-		return ctrl.Result{}, nil
+		retry := noteStatusWriteFailure(ctx, r.updateStatus(ctx, instance, original, false))
+		// Info, not Error: freezing is this guard working, and it recurs on every
+		// pass for as long as the spec points elsewhere. Logging it as an operator
+		// error buries real failures under a stacktrace each time the Deployment
+		// so much as changes its ready count. The state lives on the
+		// DatastoreTargetUnchanged condition.
+		log.Info("not reconciling workloads: the datastore target moved after migrations ran",
+			"changed", changed)
+		return requeueIf(retry), nil
 	}
 	meta.RemoveStatusCondition(&instance.Status.Conditions, conditionTypeDatastoreTarget)
 
@@ -158,9 +162,7 @@ func (r *LangfuseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			Message:            err.Error(),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
+		noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
 		return ctrl.Result{}, fmt.Errorf("building config: %w", err)
 	}
 

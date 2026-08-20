@@ -122,7 +122,7 @@ func (r *HealthMonitorReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 9. Update status. Phase and readiness are owned by the instance
 	// controller, which derives them from the conditions set above.
 	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating health status: %w", err)
+		return statusWriteFailed(err, "updating health status")
 	}
 
 	return ctrl.Result{RequeueAfter: healthCheckInterval}, nil

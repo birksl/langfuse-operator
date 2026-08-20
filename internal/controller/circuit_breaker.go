@@ -191,7 +191,7 @@ func (r *CircuitBreakerController) Reconcile(ctx context.Context, req ctrl.Reque
 	})
 
 	if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating circuit breaker status: %w", err)
+		return statusWriteFailed(err, "updating circuit breaker status")
 	}
 
 	return ctrl.Result{RequeueAfter: shortestInterval}, nil

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -87,7 +88,7 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		instance.Status.Migration.AppliedIdentity = baseline
 		if err := updateInstanceStatus(ctx, r.Client, instance, original); err != nil {
-			return ctrl.Result{}, fmt.Errorf("recording migration baseline: %w", err)
+			return statusWriteFailed(err, "recording migration baseline")
 		}
 		log.Info("recorded a migration baseline for a pre-existing instance", "identity", baseline)
 		return ctrl.Result{}, nil
@@ -125,11 +126,12 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 				strings.Join(changed, " and ")),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
-		log.Error(nil, "refusing to retarget a migrated instance", "changed", changed)
-		return ctrl.Result{}, nil
+		retry := noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
+		// Info, not Error: the refusal is this controller working as designed, and
+		// it recurs on every pass for as long as the spec stands. The state that
+		// matters is on the MigrationsComplete condition.
+		log.Info("refusing to retarget a migrated instance", "changed", changed)
+		return requeueIf(retry), nil
 	}
 
 	// The Job's migration step exits non-zero without these, so refuse to
@@ -143,11 +145,9 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 				"which the ClickHouse migration step requires", strings.Join(missing, ", ")),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
-		log.Error(nil, "refusing to create migration job", "missingKeys", missing)
-		return ctrl.Result{}, nil
+		retry := noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
+		log.Info("refusing to create migration job", "missingKeys", missing)
+		return requeueIf(retry), nil
 	}
 
 	// Build config for migration job env vars
@@ -180,9 +180,8 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			Message:            fmt.Sprintf("Running migrations for version %s", desiredTag),
 			ObservedGeneration: instance.Generation,
 		})
-		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
+		// Retry flag ignored: this path requeues while the Job runs regardless.
+		noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
 
 		if err := r.Create(ctx, job); err != nil {
 			return ctrl.Result{}, fmt.Errorf("creating migration job: %w", err)
@@ -248,12 +247,13 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			instance.Status.Migration = &v1alpha1.MigrationStatus{}
 		}
 		instance.Status.Migration.AppliedIdentity = desiredIdentity
-		if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-			log.Error(statusErr, "failed to update status")
-		}
+		// This write is the record that the migration happened. Losing it to a
+		// conflict and returning without a requeue would leave the gate open
+		// against a database that is already migrated.
+		retry := noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
 		r.Recorder.Eventf(instance, "Normal", "MigrationCompleted",
 			"Migration job %s completed successfully", jobName)
-		return ctrl.Result{}, nil
+		return requeueIf(retry), nil
 	}
 
 	// Diagnose the migration pods so a stuck or failed migration explains
@@ -275,9 +275,13 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			backoffLimit = *existingJob.Spec.BackoffLimit
 		}
 		if existingJob.Status.Failed >= backoffLimit {
-			log.Error(nil, "migration job failed", "version", desiredTag, "failures", existingJob.Status.Failed)
 			summary := fmt.Sprintf("Migration job failed after %d attempts", existingJob.Status.Failed)
 			_, message := summarizePodIssues(issues, reasonMigrationFailed, summary)
+			// A real error value, so the stacktrace this level attaches has
+			// something to sit under; logr treats a nil error as a programming
+			// mistake and the line arrives without any of the cause.
+			log.Error(errors.New(message), "migration job failed",
+				"version", desiredTag, "failures", existingJob.Status.Failed)
 			meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 				Type:               conditionMigrationsComplete,
 				Status:             metav1.ConditionFalse,
@@ -285,12 +289,10 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 				Message:            message,
 				ObservedGeneration: instance.Generation,
 			})
-			if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-				log.Error(statusErr, "failed to update status")
-			}
+			retry := noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
 			r.Recorder.Eventf(instance, "Warning", "MigrationFailed",
 				"Migration job %s failed after %d attempts: %s", jobName, existingJob.Status.Failed, message)
-			return ctrl.Result{}, nil
+			return requeueIf(retry), nil
 		}
 	}
 
@@ -308,9 +310,8 @@ func (r *MigrationController) Reconcile(ctx context.Context, req ctrl.Request) (
 			ObservedGeneration: instance.Generation,
 		})
 	}
-	if statusErr := updateInstanceStatus(ctx, r.Client, instance, original); statusErr != nil {
-		log.Error(statusErr, "failed to update status")
-	}
+	// Retry flag ignored: the 10s poll below redoes a lost write soon enough.
+	noteStatusWriteFailure(ctx, updateInstanceStatus(ctx, r.Client, instance, original))
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
