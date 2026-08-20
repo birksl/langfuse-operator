@@ -86,7 +86,6 @@ LangfuseInstance
 ├── Ingress: <name>-web (if enabled)
 ├── HPA: <name>-web (if autoscaling)
 ├── PDB: <name>-web (if enabled)
-├── ServiceMonitor: <name>-web (if enabled)
 └── NetworkPolicy: <name> (if enabled)
 
 LangfuseProject

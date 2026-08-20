@@ -1074,7 +1074,13 @@ type TelemetrySpec struct {
 
 // ObservabilitySpec defines observability configuration.
 type ObservabilitySpec struct {
-	// ServiceMonitor configures Prometheus ServiceMonitor.
+	// ServiceMonitor is deprecated and ignored; removal in 0.11.0.
+	//
+	// Langfuse serves no Prometheus endpoint, so the ServiceMonitor this created
+	// could only name the web pod's /api/public/health — a JSON route Prometheus
+	// cannot parse, leaving a target permanently reported as down. Setting this
+	// raises the Deprecated condition, and the operator removes the
+	// ServiceMonitor earlier versions created. Use OTEL instead.
 	// +optional
 	ServiceMonitor *ServiceMonitorSpec `json:"serviceMonitor,omitempty"`
 	// OTEL configures OpenTelemetry integration.
@@ -1083,15 +1089,16 @@ type ObservabilitySpec struct {
 }
 
 // ServiceMonitorSpec configures Prometheus ServiceMonitor.
+// Deprecated: no field here is read. See ObservabilitySpec.ServiceMonitor.
 type ServiceMonitorSpec struct {
-	// Enabled toggles ServiceMonitor creation.
+	// Enabled is ignored; no ServiceMonitor is created.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
-	// Interval is the scrape interval.
+	// Interval is ignored.
 	// +kubebuilder:default="30s"
 	// +optional
 	Interval string `json:"interval,omitempty"`
-	// Labels are additional labels for the ServiceMonitor.
+	// Labels are ignored.
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 }

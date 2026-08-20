@@ -1046,19 +1046,26 @@ spec:
                         type: string
                     type: object
                   serviceMonitor:
-                    description: ServiceMonitor configures Prometheus ServiceMonitor.
+                    description: |-
+                      ServiceMonitor is deprecated and ignored; removal in 0.11.0.
+
+                      Langfuse serves no Prometheus endpoint, so the ServiceMonitor this created
+                      could only name the web pod's /api/public/health — a JSON route Prometheus
+                      cannot parse, leaving a target permanently reported as down. Setting this
+                      raises the Deprecated condition, and the operator removes the
+                      ServiceMonitor earlier versions created. Use OTEL instead.
                     properties:
                       enabled:
-                        description: Enabled toggles ServiceMonitor creation.
+                        description: Enabled is ignored; no ServiceMonitor is created.
                         type: boolean
                       interval:
                         default: 30s
-                        description: Interval is the scrape interval.
+                        description: Interval is ignored.
                         type: string
                       labels:
                         additionalProperties:
                           type: string
-                        description: Labels are additional labels for the ServiceMonitor.
+                        description: Labels are ignored.
                         type: object
                     type: object
                 type: object
